@@ -72,4 +72,4 @@ if __name__ == "__main__":
     # trigger_via_post(task_id="4", ids_per_message=1, max_messages=1)
     
     # Test Case 5: Trigger EOB Fine Tuning task (task 5) via POST
-    trigger_via_post(task_id="5", ids_per_message=1, max_messages=1)
+    trigger_via_post(task_id="5", ids_per_message=5, max_messages=1)

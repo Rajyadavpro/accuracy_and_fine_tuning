@@ -656,8 +656,13 @@ def dated_json_filename(filename: str) -> str:
 # Service Bus Queue Dispatch Helper
 # ---------------------------------------------------------------------------
 
-def _send_eob_records_to_queue(records: List[Dict[str, Any]], batch_size: int = 10) -> int:
-    """Send EOB fine-tuning records to Service Bus queue in batches."""
+def _send_eob_records_to_queue(
+    records: List[Dict[str, Any]],
+    ids_per_message: int,
+    max_messages_per_run: Optional[int],
+    progress_log_batch_size: int = 10,
+) -> int:
+    """Send EOB fine-tuning records to Service Bus queue in chunked messages."""
     queue_name = os.getenv("SERVICE_BUS_QUEUE_NAME", "").strip()
     conn_string = os.getenv("SERVICE_BUS_CONNECTION_STRING", "").strip()
     
@@ -674,20 +679,37 @@ def _send_eob_records_to_queue(records: List[Dict[str, Any]], batch_size: int = 
         
         client = ServiceBusClient.from_connection_string(conn_string)
         messages_sent = 0
-        batches_sent = 0
+        records_dispatched = 0
+
+        chunks = [
+            records[i:i + ids_per_message]
+            for i in range(0, len(records), ids_per_message)
+        ]
+        if max_messages_per_run is not None and max_messages_per_run > 0:
+            chunks = chunks[:max_messages_per_run]
         
         # Set socket_timeout to 10.0 seconds (instead of the default 0.2s)
         # to allow enough time to write larger fine-tuning payloads.
         with client.get_queue_sender(queue_name, socket_timeout=10.0) as sender:
-            # Send records one at a time with error handling
-            for i, record in enumerate(records):
+            for i, chunk in enumerate(chunks):
+                allocation_ids = [rec.get("allocation_id") for rec in chunk]
+                chunk_payload = [
+                    {
+                        "file_name": rec.get("file_name"),
+                        "allocation_id": rec.get("allocation_id"),
+                        "ground_truth": rec.get("ground_truth"),
+                    }
+                    for rec in chunk
+                ]
 
 
                 try:
                     body = {
-                        "file_name": record.get("file_name"),
-                        "allocation_id": record.get("allocation_id"),
-                        "ground_truth": record.get("ground_truth"),
+                        "file_name": chunk_payload[0].get("file_name") if len(chunk_payload) == 1 else None,
+                        "allocation_id": chunk_payload[0].get("allocation_id") if len(chunk_payload) == 1 else None,
+                        "ground_truth": chunk_payload[0].get("ground_truth") if len(chunk_payload) == 1 else None,
+                        "allocation_ids": allocation_ids,
+                        "records": chunk_payload,
                         "source": "healthcare_eob",
                         "environment": os.getenv("LANGFUSE_ENVIRONMENT", "exp"),
                         "process_type": "FineTuning",
@@ -696,14 +718,14 @@ def _send_eob_records_to_queue(records: List[Dict[str, Any]], batch_size: int = 
                     msg = ServiceBusMessage(json.dumps(body, cls=_Encoder))
                     sender.send_messages(msg)
                     messages_sent += 1
+                    records_dispatched += len(chunk)
                     
-                    if (i + 1) % batch_size == 0:
-                        logging.info(f"[Queue] Sent batch: {messages_sent}/{len(records)} records")
-                        batches_sent += 1
+                    if (i + 1) % progress_log_batch_size == 0:
+                        logging.info(f"[Queue] Sent {messages_sent}/{len(chunks)} messages; records dispatched={records_dispatched}")
                 except Exception as e:
-                    logging.warning(f"[Queue] Failed to send record {record.get('allocation_id')}: {e}")
+                    logging.warning(f"[Queue] Failed to send chunk with allocation_ids={allocation_ids}: {e}")
             
-            logging.info(f"[Queue] SUCCESS: {messages_sent}/{len(records)} records sent ({batches_sent} batches)")
+            logging.info(f"[Queue] SUCCESS: {messages_sent}/{len(chunks)} messages sent; records dispatched={records_dispatched}")
             return messages_sent
     except Exception as e:
         logging.error(f"[Queue] Error sending to queue: {e}")
@@ -728,8 +750,28 @@ def eob_fine_tuning_data_push(
     outdir_name = runtime_cfg["output_dir"]
     pdf_subdir = runtime_cfg["pdf_output_subdir"]
 
+    env_ids_per_message = (os.getenv("IDS_PER_MESSAGE") or "").strip()
+    eff_ids_per_message = ids_per_message if ids_per_message is not None else int(env_ids_per_message or "1")
+    if eff_ids_per_message <= 0:
+        raise ValueError("ids_per_message must be greater than 0")
+
+    env_max_messages = (os.getenv("MAX_MESSAGES_PER_RUN") or "").strip()
+    eff_max_messages_per_run = (
+        max_messages_per_run
+        if max_messages_per_run is not None
+        else int(env_max_messages) if env_max_messages else None
+    )
+    if eff_max_messages_per_run is not None and eff_max_messages_per_run <= 0:
+        raise ValueError("max_messages_per_run must be greater than 0 when provided")
+
+    logging.info(
+        "[Config] Effective queue batching: ids_per_message=%s, max_messages_per_run=%s",
+        eff_ids_per_message,
+        eff_max_messages_per_run,
+    )
+
     outdir = outdir_name if os.path.isabs(outdir_name) else os.path.join(script_dir, outdir_name)
-    os.makedirs(outdir, exist_ok=True)
+    # os.makedirs(outdir, exist_ok=True)
     pdf_output_dir = os.path.join(outdir, pdf_subdir)
     download_enabled = False
     container_client = None
@@ -780,9 +822,9 @@ def eob_fine_tuning_data_push(
             logging.error(f"Table resolution error: {ex}")
             raise ex
 
-        # Use max_messages_per_run to set query row bounds if configured
-        fetch_all = (max_messages_per_run is None)
-        max_rows = max_messages_per_run if max_messages_per_run is not None else 10
+        # Fetch enough rows to fill the requested number of outbound messages.
+        fetch_all = eff_max_messages_per_run is None
+        max_rows = (eff_ids_per_message * eff_max_messages_per_run) if eff_max_messages_per_run is not None else 10
 
         allocations = fetch_allocations(conn, tables["allocation"], None, max_rows, fetch_all)
         if not allocations:
@@ -921,7 +963,11 @@ def eob_fine_tuning_data_push(
         
         # Send records to Service Bus queue for downstream processing
         if outputs:
-            queue_count = _send_eob_records_to_queue(outputs)
+            queue_count = _send_eob_records_to_queue(
+                outputs,
+                ids_per_message=eff_ids_per_message,
+                max_messages_per_run=eff_max_messages_per_run,
+            )
         else:
             queue_count = 0
 

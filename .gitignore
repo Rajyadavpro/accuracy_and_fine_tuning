@@ -29,3 +29,4 @@ Thumbs.db
 # Project-generated data artifacts
 fine_tuning/EOB_Fine_Tuning_data/*.json
 fetched_messages/
+check_json.py
