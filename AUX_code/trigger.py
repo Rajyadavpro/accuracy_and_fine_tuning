@@ -58,18 +58,21 @@ if __name__ == "__main__":
     
     # Test Case 1: Trigger IDP task (task 1) via GET
     # Batches 5 IDs per message, with a maximum of 3 messages total
-    # trigger_via_get(task_id="1", ids_per_message=1, max_messages=1)
+    trigger_via_get(task_id="1", ids_per_message=1, max_messages=1)
 
     # Test Case 2: Trigger Tabak task (task 2) via POST
     # Batches 10 IDs per message, with a maximum of 2 messages total
-    # trigger_via_post(task_id="2", ids_per_message=1, max_messages=1)
+    trigger_via_post(task_id="2", ids_per_message=1, max_messages=1)
 
     # Test Case 3: Trigger Healthcare task (task 3) via GET (Minimal run)
     # Batches 1 ID per message, with a maximum of 1 message total
-    # trigger_via_get(task_id="3", ids_per_message=1, max_messages=1)
+    trigger_via_get(task_id="3", ids_per_message=1, max_messages=1)
 
     # Test Case 4: Trigger Tabak Fine Tuning task (task 4) via POST
-    # trigger_via_post(task_id="4", ids_per_message=1, max_messages=1)
+    trigger_via_post(task_id="4", ids_per_message=1, max_messages=1)
     
     # Test Case 5: Trigger EOB Fine Tuning task (task 5) via POST
-    trigger_via_post(task_id="5", ids_per_message=5, max_messages=1)
+    trigger_via_post(task_id="5", ids_per_message=1, max_messages=1)
+
+    # Test Case 6: Trigger Superbill Fine Tuning task (task 6) via GET
+    trigger_via_get(task_id="6", ids_per_message=1, max_messages=1)

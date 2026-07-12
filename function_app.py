@@ -5,7 +5,7 @@ from accuracy_calc.tabak_accuracy_data_get import tabak_data_push
 from accuracy_calc.healthcare_accuarcy_get_data import healthcare_data_push
 from fine_tuning.tabak_fine_tuning_data_get import tabak_fine_tuning_data_push
 from fine_tuning.eob_fine_tuning_data_get import eob_fine_tuning_data_push
-
+from fine_tuning.superbill_fine_tuning_data_get import superbill_fine_tuning_data_push
 app = func.FunctionApp()
 
 
@@ -106,10 +106,15 @@ def main_http_trigger(req: func.HttpRequest) -> func.HttpResponse:
 
 
         elif task_id == '6':
-            return func.HttpResponse("Task 6 not implemented yet.", status_code=501)
+            logging.info(f"Triggering Superbill Fine Tuning data push with ids_per_message={ids_per_message}, max_messages_per_run={max_messages_per_run}")
+            superbill_fine_tuning_data_push(ids_per_message=ids_per_message, max_messages_per_run=max_messages_per_run)
+
+            
+        elif task_id == '7':
+            return func.HttpResponse("Task 7 not implemented yet.", status_code=501)
         else:
             return func.HttpResponse(
-                "Please provide a valid 'task_id' parameter (from 1 to 6).",
+                "Please provide a valid 'task_id' parameter (from 1 to 7).",
                 status_code=400
             )
             
