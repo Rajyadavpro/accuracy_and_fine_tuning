@@ -1,0 +1,5 @@
+azure-functions
+azure-servicebus
+pymssql
+pymysql
+langfuse>=2.57,<3.0

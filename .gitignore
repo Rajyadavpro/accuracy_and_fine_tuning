@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments
+.venv/
+venv/
+
+# Azure Functions local artifacts and secrets
+local.settings.json
+.env
+
+# Build and logs
+*.log
+*.tmp
+
+# OS/editor artifacts
+.DS_Store
+Thumbs.db
+.vscode/
+
+# Project-generated data artifacts
+fine_tuning/EOB_Fine_Tuning_data/*.json
+fetched_messages/
