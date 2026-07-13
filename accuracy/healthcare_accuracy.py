@@ -46,7 +46,7 @@ FILE_TYPE = "both"
 MAX_ROWS: int | str = "all"
 PAGE_SIZE = 10
 UPLOAD_EACH_BATCH = True
-UPLOAD_EVERY_ROWS = 30
+UPLOAD_EVERY_ROWS = 10
 MAX_WORKERS = 4
 # Resume from last saved allocation in Langfuse (implicit checkpoint), with a
 # small lookback window to recover near-tail misses from partial failures.

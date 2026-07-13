@@ -356,7 +356,7 @@ def run_eob(row_limit: int | None, page_size: int) -> tuple[AuditSummary, list[d
                     _log(f"[EOB] Batch {batch_number}: finished allocation_id={row_id} in {time.perf_counter() - row_started:.2f}s")
 
                 _log(f"[EOB] Batch {batch_number}: advanced watermark to allocation_id={last_allocation_id}")
-                if UPLOAD_EACH_BATCH and len(pending_upload_rows) >= UPLOAD_EVERY_ROWS:
+                if UPLOAD_EACH_BATCH and pending_upload_rows:
                     to_upload = list(pending_upload_rows)
                     pending_upload_rows.clear()
                     _log(f"[EOB] Uploading chunk of {len(to_upload)} rows to Langfuse.")
