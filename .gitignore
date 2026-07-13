@@ -16,6 +16,7 @@ venv/
 # Azure Functions local artifacts and secrets
 local.settings.json
 .env
+project_structure.json
 
 # Build and logs
 *.log

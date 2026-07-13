@@ -1,30 +1,39 @@
 import azure.functions as func
 import logging
-import os
-
-# 1. Import the 'main' functions from your 3 script files, renaming them to avoid conflicts
-from accuracy.idp_accuarcy import main as run_idp_accuracy
-from accuracy.tabak_accuarcy import main as run_tabak_accuracy
-from accuracy.healthcare_eob_accuracy import main as run_healthcare_eob_accuracy
-from accuracy.healthcare_accuracy import main as run_healthcare_accuracy
-from accuracy.healthcare_superbill_accuracy import main as run_healthcare_superbill_accuracy
-
-# Keep your existing imports for tasks 4, 5, 6
+from accuracy_calc.idp_accuracy_data_get import idp_data_push
+from accuracy_calc.tabak_accuracy_data_get import tabak_data_push
+from accuracy_calc.healthcare_accuarcy_get_data import healthcare_data_push
 from fine_tuning.tabak_fine_tuning_data_get import tabak_fine_tuning_data_push
 from fine_tuning.eob_fine_tuning_data_get import eob_fine_tuning_data_push
 from fine_tuning.superbill_fine_tuning_data_get import superbill_fine_tuning_data_push
+from accuracy_calc.healthcare_superbill_get_data import healthcare_superbill_push
+from accuracy_calc.healthcare_eob_get_data import healthcare_eob_push
+
+
 
 app = func.FunctionApp()
+
 
 # ==========================================
 # TIMER TRIGGER ENTRY POINT
 # ==========================================
+# @app.timer_trigger(schedule="0 */5 * * * *", arg_name="myTimer", run_on_startup=False, use_monitor=False)
+# def main_timer_trigger(myTimer: func.TimerRequest) -> None:
+
 @app.timer_trigger(schedule="0 0 * * * *", arg_name="myTimer", run_on_startup=False, use_monitor=False)
 def main_timer_trigger(myTimer: func.TimerRequest) -> None:
     if myTimer.past_due:
         logging.info('The timer is past due.')
+
     logging.info('Timer trigger activated. Running all 3 associated tasks...')
+    
+    # Timer executions fall back to environment variable defaults
+    # idp_data_push()
+    # tabak_data_push()
+    # healthcare_data_push()
+    
     logging.info('All timer tasks completed.')
+
 
 # ==========================================
 # HTTP TRIGGER ENTRY POINT (WITH TEST PARAMS)
@@ -33,12 +42,14 @@ def main_timer_trigger(myTimer: func.TimerRequest) -> None:
 def main_http_trigger(req: func.HttpRequest) -> func.HttpResponse:
     logging.info('HTTP trigger activated. Evaluating parameters...')
     
-    # Parse 'task_id' and optional params
+    # 1. Parse 'task_id'
     task_id = req.params.get('task_id')
+    
+    # 2. Parse test execution overrides from query parameters
     ids_per_message_raw = req.params.get('ids_per_message')
     max_messages_raw = req.params.get('max_messages_per_run')
-    file_type_raw = req.params.get('file_type')
     
+    # 3. If query parameters are empty, attempt parsing the POST body
     body_data = {}
     try:
         body_data = req.get_json() or {}
@@ -51,16 +62,6 @@ def main_http_trigger(req: func.HttpRequest) -> func.HttpResponse:
         ids_per_message_raw = body_data.get('ids_per_message')
     if not max_messages_raw:
         max_messages_raw = body_data.get('max_messages_per_run')
-    if not file_type_raw:
-        file_type_raw = body_data.get('file_type')
-
-    file_type = None
-    if file_type_raw is not None:
-        candidate = str(file_type_raw).strip().lower()
-        if candidate in {"both", "eob", "superbill"}:
-            file_type = candidate
-        else:
-            logging.warning(f"Invalid file_type provided: {file_type_raw}. Allowed: both|eob|superbill")
 
     # Convert values to integers safely
     ids_per_message = None
@@ -83,41 +84,37 @@ def main_http_trigger(req: func.HttpRequest) -> func.HttpResponse:
             status_code=400
         )
 
-    # 2. Execute selected function passing the test variables
+    # Execute selected function passing the test variables
     try:
         if task_id == '1':
-            logging.info("Triggering IDP Accuracy script")
-            run_idp_accuracy()  # Replaced idp_data_push() with your script
+            logging.info(f"Triggering IDP data push with ids_per_message={ids_per_message}, max_messages_per_run={max_messages_per_run}")
+            idp_data_push(ids_per_message=ids_per_message, max_messages_per_run=max_messages_per_run)
             
         elif task_id == '2':
-            logging.info("Triggering Tabak Accuracy script")
-            run_tabak_accuracy() # Replaced tabak_data_push() with your script
+            logging.info(f"Triggering Tabak data push with ids_per_message={ids_per_message}, max_messages_per_run={max_messages_per_run}")
+            tabak_data_push(ids_per_message=ids_per_message, max_messages_per_run=max_messages_per_run)
 
         elif task_id == '3':
-            if file_type == "eob":
-                os.environ["HEALTHCARE_ACCURACY_FILE_TYPE"] = file_type
-                logging.info("Triggering Healthcare EOB Accuracy script")
-                run_healthcare_eob_accuracy()
-            elif file_type == "superbill":
-                os.environ["HEALTHCARE_ACCURACY_FILE_TYPE"] = file_type
-                logging.info("Triggering Healthcare Superbill Accuracy script")
-                run_healthcare_superbill_accuracy()
-            else:
-                os.environ.pop("HEALTHCARE_ACCURACY_FILE_TYPE", None)
-                logging.info("Triggering Healthcare Accuracy script (file_type=both)")
-                run_healthcare_accuracy() # Replaced healthcare_eob_push() and healthcare_superbill_push() with your script
-
+            logging.info(f"Triggering Healthcare data push with ids_per_message={ids_per_message}, max_messages_per_run={max_messages_per_run}")
+            # healthcare_data_push(ids_per_message=ids_per_message, max_messages_per_run=max_messages_per_run)
+            healthcare_eob_push()
+            healthcare_superbill_push()
+        # Placeholder routes for extra HTTP tasks
         elif task_id == '4':
+            # Task 4 handles the dedicated Fine Tuning workflow
             logging.info(f"Triggering Tabak Fine Tuning data push with ids_per_message={ids_per_message}, max_messages_per_run={max_messages_per_run}")
             tabak_fine_tuning_data_push(ids_per_message=ids_per_message, max_messages_per_run=max_messages_per_run)
+            # Removed erroneous closing parenthesis
             
         elif task_id == '5':
             logging.info(f"Triggering EOB Fine Tuning data push with ids_per_message={ids_per_message}, max_messages_per_run={max_messages_per_run}")
             eob_fine_tuning_data_push(ids_per_message=ids_per_message, max_messages_per_run=max_messages_per_run)
 
+
         elif task_id == '6':
             logging.info(f"Triggering Superbill Fine Tuning data push with ids_per_message={ids_per_message}, max_messages_per_run={max_messages_per_run}")
             superbill_fine_tuning_data_push(ids_per_message=ids_per_message, max_messages_per_run=max_messages_per_run)
+
             
         elif task_id == '7':
             return func.HttpResponse("Task 7 not implemented yet.", status_code=501)

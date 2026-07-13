@@ -330,6 +330,7 @@
 #         raise e
 #     logging.info(f"[Queue] SUCCESS: All {len(messages)} messages successfully written to Service Bus queue '{QUEUE_NAME}'.")
 
+
 # # ==========================================
 # # TIMER TASK 1 IMPLEMENTATION
 # # ==========================================
@@ -420,6 +421,7 @@
 #             "record_ids": chunk,
 #             "source": "idp",
 #             "environment": LANGFUSE_ENVIRONMENT,
+#             "process_type": "Accuracy",
 #             "queued_at": datetime.now(timezone.utc).isoformat()
 #         }
 #         json_payload = json.dumps(payload)
@@ -472,11 +474,13 @@
 
 
 
+
 import os
 import pymssql
 import logging
 import json
 import tempfile
+from pathlib import Path
 from datetime import datetime, timezone
 from typing import Optional, List, Dict, Any
 from azure.servicebus import ServiceBusClient, ServiceBusMessage
@@ -485,30 +489,24 @@ from azure.servicebus import ServiceBusClient, ServiceBusMessage
 # SETUP DUAL-LOGGING (CONSOLE & FILE)
 # ==========================================
 
-# Resolve file paths allowing fallback to temp directory if write permissions are constrained
 DEFAULT_LOG_FILE = os.path.join(tempfile.gettempdir(), "idp_data_push.log")
 LOG_FILE_PATH = os.getenv("LOG_FILE_PATH", DEFAULT_LOG_FILE)
 LOG_LEVEL_STR = os.getenv("LOG_LEVEL", "INFO").upper()
 LOG_LEVEL = getattr(logging, LOG_LEVEL_STR, logging.INFO)
 
-# Prepare root logger configuration
 root_logger = logging.getLogger()
 root_logger.setLevel(LOG_LEVEL)
 
-# Remove existing handlers to avoid duplicates in certain run environments
 for handler in root_logger.handlers[:]:
     root_logger.removeHandler(handler)
 
-# Unified log format (includes line numbers and exact filenames for traceability)
 log_formatter = logging.Formatter("%(asctime)s [%(levelname)s] (%(filename)s:%(lineno)d) - %(message)s")
 
-# 1. Console Handler
 console_handler = logging.StreamHandler()
 console_handler.setLevel(LOG_LEVEL)
 console_handler.setFormatter(log_formatter)
 root_logger.addHandler(console_handler)
 
-# 2. File Handler (Protected with try-except fallback)
 file_write_success = False
 try:
     file_handler = logging.FileHandler(LOG_FILE_PATH, encoding='utf-8')
@@ -526,7 +524,20 @@ if file_write_success:
 logging.info("=============================================================")
 
 
-# Ensure Langfuse import is attempted
+AUDIT_DIR = Path(os.getenv("AUDIT_LOG_DIR", "AUX_code/audit_logs"))
+
+
+def _append_jsonl(file_name: str, payload: Dict[str, Any]) -> None:
+    """Best-effort append to local JSONL audit log files."""
+    try:
+        AUDIT_DIR.mkdir(parents=True, exist_ok=True)
+        file_path = AUDIT_DIR / file_name
+        with file_path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(payload, ensure_ascii=True) + "\n")
+    except Exception as e:
+        logging.warning(f"[Audit] Could not append to {file_name}: {e}")
+
+
 try:
     from langfuse import Langfuse
     logging.info("[Langfuse] Langfuse library detected and imported successfully.")
@@ -558,8 +569,17 @@ if not LANGFUSE_ENVIRONMENT:
     raise ValueError("LANGFUSE_ENVIRONMENT must be set.")
 LANGFUSE_ENVIRONMENT = LANGFUSE_ENVIRONMENT.strip()
 
+# Checkpoint Dataset Name
 CHECKPOINT_DATASET_NAME = f"idp_accuracy_checkpoint_{LANGFUSE_ENVIRONMENT}"
-logging.info(f"[Config] Derived Dataset Name: '{CHECKPOINT_DATASET_NAME}'")
+logging.info(f"[Config] Derived Checkpoint Dataset Name: '{CHECKPOINT_DATASET_NAME}'")
+
+# Predictions Dataset Toggle & Name
+SAVE_PREDICTIONS_DATASET_STR = os.getenv("SAVE_PREDICTIONS_DATASET", "true").strip().upper()
+SAVE_PREDICTIONS_DATASET = SAVE_PREDICTIONS_DATASET_STR in ("TRUE", "1", "YES")
+PREDICTIONS_DATASET_NAME = f"idp_predictions_{LANGFUSE_ENVIRONMENT}"
+logging.info(f"[Config] Predictions Dataset Save Enabled: {SAVE_PREDICTIONS_DATASET}")
+if SAVE_PREDICTIONS_DATASET:
+    logging.info(f"[Config] Derived Predictions Dataset Name: '{PREDICTIONS_DATASET_NAME}'")
 
 QUEUE_NAME = os.getenv("SERVICE_BUS_QUEUE_NAME")
 logging.info(f"[Config] Check -> SERVICE_BUS_QUEUE_NAME: '{QUEUE_NAME}'")
@@ -691,14 +711,36 @@ def _save_checkpoint_to_langfuse(last_id: str) -> None:
             name=CHECKPOINT_DATASET_NAME,
             description=f"IDP accuracy checkpoint ({LANGFUSE_ENVIRONMENT})"
         )
+        _append_jsonl(
+            "langfuse_dataset_events.jsonl",
+            {
+                "event": "create_dataset",
+                "dataset": CHECKPOINT_DATASET_NAME,
+                "description": f"IDP accuracy checkpoint ({LANGFUSE_ENVIRONMENT})",
+                "saved_at": datetime.now(timezone.utc).isoformat(),
+            },
+        )
         
-        checkpoint_item_id = f"checkpoint::id::{last_id}"
+        checkpoint_item_id = f"{CHECKPOINT_DATASET_NAME}::checkpoint::id::{last_id}"
         checkpoint_payload = {
             "last_id": last_id,
             "saved_at": datetime.now(timezone.utc).isoformat(),
         }
         
         logging.info(f"[Langfuse] Uploading checkpoint item '{checkpoint_item_id}' to dataset '{CHECKPOINT_DATASET_NAME}'...")
+        _append_jsonl(
+            "langfuse_checkpoint_items.jsonl",
+            {
+                "dataset": CHECKPOINT_DATASET_NAME,
+                "item_id": checkpoint_item_id,
+                "input": checkpoint_payload,
+                "metadata": {
+                    "record_type": "idp_checkpoint",
+                    "last_id": last_id,
+                },
+                "saved_at": datetime.now(timezone.utc).isoformat(),
+            },
+        )
         langfuse.create_dataset_item(
             dataset_name=CHECKPOINT_DATASET_NAME,
             id=checkpoint_item_id,
@@ -714,6 +756,75 @@ def _save_checkpoint_to_langfuse(last_id: str) -> None:
         logging.info(f"[Langfuse] SUCCESS: Checkpoint saved with last_id: '{last_id}'")
     except Exception as ex:
         logging.error(f"[Langfuse] FAILURE: Error updating checkpoint: {ex}", exc_info=True)
+        raise ex
+
+
+def _save_predictions_to_langfuse(records: List[Dict[str, str]]) -> None:
+    """Saves processed prediction metadata to a separate dataset on Langfuse."""
+    logging.info(f"[Langfuse] Initiating predictions dataset upload for {len(records)} items...")
+    try:
+        langfuse = _get_langfuse_client()
+    except Exception as init_err:
+        logging.error(f"[Langfuse] FAILURE: Could not connect to Langfuse client to save predictions: {init_err}")
+        raise init_err
+
+    try:
+        logging.info(f"[Langfuse] Ensuring predictions dataset '{PREDICTIONS_DATASET_NAME}' exists...")
+        langfuse.create_dataset(
+            name=PREDICTIONS_DATASET_NAME,
+            description=f"IDP accuracy predictions ({LANGFUSE_ENVIRONMENT})"
+        )
+        _append_jsonl(
+            "langfuse_dataset_events.jsonl",
+            {
+                "event": "create_dataset",
+                "dataset": PREDICTIONS_DATASET_NAME,
+                "description": f"IDP accuracy predictions ({LANGFUSE_ENVIRONMENT})",
+                "saved_at": datetime.now(timezone.utc).isoformat(),
+            },
+        )
+
+        for record in records:
+            record_id = record["id"]
+            item_id = f"{PREDICTIONS_DATASET_NAME}::prediction::id::{record_id}"
+            
+            # Formulate payload matching your exact schema layout
+            payload = {
+                "id": record_id,
+                "filename": record["filename"],
+                "prediction": record["prediction"],
+                "created on": record["created on"]
+            }
+
+            item_metadata = {
+                "record_type": "idp_prediction",
+                "environment": LANGFUSE_ENVIRONMENT,
+                "saved_at": datetime.now(timezone.utc).isoformat(),
+            }
+
+            _append_jsonl(
+                "langfuse_prediction_items.jsonl",
+                {
+                    "dataset": PREDICTIONS_DATASET_NAME,
+                    "item_id": item_id,
+                    "input": payload,
+                    "metadata": item_metadata,
+                },
+            )
+
+            logging.debug(f"[Langfuse] Uploading prediction item '{item_id}' to dataset '{PREDICTIONS_DATASET_NAME}'...")
+            langfuse.create_dataset_item(
+                dataset_name=PREDICTIONS_DATASET_NAME,
+                id=item_id,
+                input=payload,
+                metadata=item_metadata
+            )
+
+        logging.info("[Langfuse] Flushing sync buffer for predictions...")
+        langfuse.flush()
+        logging.info(f"[Langfuse] SUCCESS: Registered {len(records)} predictions inside dataset '{PREDICTIONS_DATASET_NAME}'")
+    except Exception as ex:
+        logging.error(f"[Langfuse] FAILURE: Error updating predictions dataset: {ex}", exc_info=True)
         raise ex
 
 
@@ -747,7 +858,6 @@ def _get_db_connection() -> pymssql.Connection:
         logging.error("[Database] FAILURE: Missing database configuration: IDP_SQL_PASSWORD is not set.")
         raise ValueError("IDP_SQL_PASSWORD is required.")
 
-    # Parse host and port from server string (e.g. "myserver.database.windows.net,1433")
     host = server.strip()
     port = 1433
     if "," in host:
@@ -794,6 +904,16 @@ def _send_to_azure_queue(messages: List[str]) -> None:
                 for idx, msg in enumerate(messages):
                     try:
                         logging.info(f"[Queue] Dispatching message {idx + 1}/{len(messages)} (Length: {len(msg)} characters)...")
+                        _append_jsonl(
+                            "queue_messages_sent.jsonl",
+                            {
+                                "queue": QUEUE_NAME,
+                                "message_index": idx + 1,
+                                "total_messages": len(messages),
+                                "payload": json.loads(msg),
+                                "saved_at": datetime.now(timezone.utc).isoformat(),
+                            },
+                        )
                         sender.send_messages(ServiceBusMessage(msg))
                         logging.info(f"[Queue] SUCCESS: Message {idx + 1}/{len(messages)} was sent successfully.")
                     except Exception as e:
@@ -811,7 +931,6 @@ def _send_to_azure_queue(messages: List[str]) -> None:
 
 def idp_data_push(ids_per_message: Optional[int] = None, max_messages_per_run: Optional[int] = None) -> None:
     """Performs strict incremental retrieval and queue dispatch. Falls back to env var defaults when parameters are not supplied."""
-    # Fall back to module-level env var values (used by timer trigger which passes no args)
     if ids_per_message is None:
         ids_per_message = IDS_PER_MESSAGE
     if max_messages_per_run is None:
@@ -828,13 +947,22 @@ def idp_data_push(ids_per_message: Optional[int] = None, max_messages_per_run: O
     logging.info("[Timer Task 1] Step 1: Checking latest checkpoint from Langfuse...")
     last_checkpoint_id = _load_checkpoint_from_langfuse()
     
-    # 2. Build the query based on checkpoint availability
-    # ORDER BY v.Id ASC so pagination is consistent and deterministic
+    # 2. Build the query based on checkpoint availability. v.CreatedOn retrieves the creation date field.
     query_params = []
     if last_checkpoint_id:
         logging.info(f"[Timer Task 1] Step 2: Checkpoint retrieved. Last processed ID: '{last_checkpoint_id}'. Executing incremental query.")
         query = (
-            "SELECT DISTINCT v.Id "
+            "SELECT DISTINCT "
+            "  v.Id, "
+            "  CASE WHEN ISJSON(v.ResponsePayload) = 1 "
+            "       THEN JSON_VALUE(v.ResponsePayload, '$.json[0].\"File Name\"') "
+            "       ELSE NULL "
+            "  END AS FileName, "
+            "  COALESCE(" 
+            "       CASE WHEN ISJSON(v.ResponsePayload) = 1 THEN JSON_VALUE(v.ResponsePayload, '$.json[0].\"Predicted Category\"') END, "
+            "       CASE WHEN ISJSON(v.ResponsePayload) = 1 THEN JSON_VALUE(v.ResponsePayload, '$.json[0].\"Original Category\"') END" 
+            "  ) AS Prediction, "
+            "  v.CreatedOn "
             "FROM dbo.vw_PdfClassificationTransactionLog v "
             "WHERE v.Id > %s "
             "ORDER BY v.Id ASC;"
@@ -844,7 +972,17 @@ def idp_data_push(ids_per_message: Optional[int] = None, max_messages_per_run: O
     else:
         logging.info("[Timer Task 1] Step 2: No checkpoint found. Initializing query over full dataset.")
         query = (
-            "SELECT DISTINCT v.Id "
+            "SELECT DISTINCT "
+            "  v.Id, "
+            "  CASE WHEN ISJSON(v.ResponsePayload) = 1 "
+            "       THEN JSON_VALUE(v.ResponsePayload, '$.json[0].\"File Name\"') "
+            "       ELSE NULL "
+            "  END AS FileName, "
+            "  COALESCE(" 
+            "       CASE WHEN ISJSON(v.ResponsePayload) = 1 THEN JSON_VALUE(v.ResponsePayload, '$.json[0].\"Predicted Category\"') END, "
+            "       CASE WHEN ISJSON(v.ResponsePayload) = 1 THEN JSON_VALUE(v.ResponsePayload, '$.json[0].\"Original Category\"') END" 
+            "  ) AS Prediction, "
+            "  v.CreatedOn "
             "FROM dbo.vw_PdfClassificationTransactionLog v "
             "ORDER BY v.Id ASC;"
         )
@@ -859,22 +997,41 @@ def idp_data_push(ids_per_message: Optional[int] = None, max_messages_per_run: O
             cursor.execute(query, query_params)
             rows = cursor.fetchall()
             
-            unique_keys = [str(row[0]).strip() for row in rows if row[0] is not None]
-            logging.info(f"[Timer Task 1] SUCCESS: Retrieved {len(rows)} raw rows. Extracted {len(unique_keys)} clean unique IDs.")
+            # Map database records into dictionary payloads
+            records = []
+            for row in rows:
+                if row[0] is not None:
+                    # Safely handle the created_on database value if present; fallback to current runtime string
+                    created_on_val = ""
+                    if len(row) > 3 and row[3] is not None:
+                        if hasattr(row[3], 'isoformat'):
+                            created_on_val = row[3].isoformat()
+                        else:
+                            created_on_val = str(row[3]).strip()
+                    else:
+                        created_on_val = datetime.now(timezone.utc).isoformat()
+
+                    records.append({
+                        "id": str(row[0]).strip(),
+                        "filename": str(row[1]).strip() if row[1] is not None else "",
+                        "prediction": str(row[2]).strip() if row[2] is not None else "",
+                        "created on": created_on_val
+                    })
+
+            logging.info(f"[Timer Task 1] SUCCESS: Retrieved {len(rows)} raw rows. Extracted {len(records)} unique records.")
     except Exception as e:
         logging.error(f"[Timer Task 1] FAILURE: Database step failed during query execution: {e}", exc_info=True)
         raise e
 
-    # 4. Process and calculate keys to dispatch
-    total_keys = len(unique_keys)
-    logging.info(f"[Timer Task 1] Step 4: Assessing structural segments for {total_keys} unique keys.")
+    total_records = len(records)
+    logging.info(f"[Timer Task 1] Step 4: Assessing structural segments for {total_records} records.")
 
-    if total_keys == 0:
+    if total_records == 0:
         logging.info("[Timer Task 1] SUCCESS: No new records identified since last execution. Workflow finished cleanly.")
         return
 
-    # Group IDs into chunks
-    chunks = [unique_keys[i:i + ids_per_message] for i in range(0, total_keys, ids_per_message)]
+    # Group records into chunks
+    chunks = [records[i:i + ids_per_message] for i in range(0, total_records, ids_per_message)]
     total_chunks = len(chunks)
     logging.info(f"[Timer Task 1] Segregation result: {total_chunks} chunk(s) calculated.")
     
@@ -887,12 +1044,13 @@ def idp_data_push(ids_per_message: Optional[int] = None, max_messages_per_run: O
     else:
         logging.info(f"[Timer Task 1] Volume within execution threshold. All {total_chunks} chunk(s) are eligible to send.")
 
-    # Format into JSON payloads
+    # Format into JSON payloads (retaining original payload format containing only IDs to prevent downstream breaking changes)
     logging.info("[Timer Task 1] Generating standard message structures...")
     formatted_messages = []
     for idx, chunk in enumerate(chunks):
+        chunk_ids = [r["id"] for r in chunk]
         payload = {
-            "record_ids": chunk,
+            "record_ids": chunk_ids,
             "source": "idp",
             "environment": LANGFUSE_ENVIRONMENT,
             "process_type": "Accuracy",
@@ -900,10 +1058,10 @@ def idp_data_push(ids_per_message: Optional[int] = None, max_messages_per_run: O
         }
         json_payload = json.dumps(payload)
         formatted_messages.append(json_payload)
-        logging.debug(f"[Timer Task 1] Chunk {idx + 1} structured with {len(chunk)} keys.")
+        logging.debug(f"[Timer Task 1] Chunk {idx + 1} structured with {len(chunk_ids)} keys.")
 
     # Last ID in the last dispatched chunk — used as the checkpoint bookmark
-    last_dispatched_id = chunks[-1][-1]
+    last_dispatched_id = chunks[-1][-1]["id"]
     logging.info(f"[Timer Task 1] Last dispatched ID: '{last_dispatched_id}'")
 
     # 5. Push formatted payloads to the Queue
@@ -915,20 +1073,33 @@ def idp_data_push(ids_per_message: Optional[int] = None, max_messages_per_run: O
         logging.error(f"[Timer Task 1] FAILURE: Queue dispatch failed: {e}", exc_info=True)
         raise e
 
-    # 6. Save checkpoint to Langfuse using the last dispatched ID
-    # - Capped run: last ID in the last dispatched chunk (partial progress bookmark)
-    # - Full run: same — last ID of all dispatched records
+    # 6. Save checkpoint and (optional) prediction records to Langfuse
     if is_capped:
         logging.info(f"[Timer Task 1] Step 6: Capped run — saving partial progress checkpoint. Last dispatched ID: '{last_dispatched_id}'")
     else:
         logging.info(f"[Timer Task 1] Step 6: Full run — saving checkpoint. Last dispatched ID: '{last_dispatched_id}'")
 
+    # Save Checkpoint Dataset (Dataset #1)
     try:
         _save_checkpoint_to_langfuse(last_dispatched_id)
         logging.info(f"[Timer Task 1] SUCCESS: Checkpoint saved to Langfuse with last_id: '{last_dispatched_id}'")
     except Exception as e:
         logging.error(f"[Timer Task 1] FAILURE: Langfuse checkpoint sync failed: {e}", exc_info=True)
         raise e
+
+    # Save Predictions Dataset (Dataset #2) - Triggered via Toggle
+    if SAVE_PREDICTIONS_DATASET:
+        # Extract only the processed records that we actually dispatched in the chunks
+        dispatched_records = [rec for chunk in chunks for rec in chunk]
+        logging.info(f"[Timer Task 1] Step 7: Saving {len(dispatched_records)} dispatched items to predictions dataset '{PREDICTIONS_DATASET_NAME}'...")
+        try:
+            _save_predictions_to_langfuse(dispatched_records)
+            logging.info("[Timer Task 1] SUCCESS: Predictions dataset synchronization complete.")
+        except Exception as e:
+            logging.error(f"[Timer Task 1] FAILURE: Predictions dataset save failed: {e}", exc_info=True)
+            raise e
+    else:
+        logging.info("[Timer Task 1] Step 7: Predictions dataset generation disabled (SAVE_PREDICTIONS_DATASET not set to TRUE).")
 
     logging.info("=============================================================")
     logging.info("[Timer Task 1] Workflow execution successfully completed.")

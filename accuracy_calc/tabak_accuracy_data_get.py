@@ -1,3 +1,4 @@
+
 # import os
 # import pymysql
 # import logging
@@ -342,6 +343,7 @@
 #             "record_ids": chunk,
 #             "source": "tabak",
 #             "environment": langfuse_environment,
+#             "process_type": "Accuracy",
 #             "queued_at": datetime.now(timezone.utc).isoformat()
 #         }
 #         formatted_messages.append(json.dumps(payload))
@@ -387,13 +389,15 @@
 
 
 
+
 import os
 import pymysql
 import logging
 import json
 import tempfile
+from pathlib import Path
 from datetime import datetime, timezone
-from typing import Optional, List
+from typing import Optional, List, Dict, Any
 from azure.servicebus import ServiceBusClient, ServiceBusMessage
 
 # ==========================================
@@ -440,6 +444,55 @@ try:
 except ImportError:
     logging.error("[Langfuse] FAILURE: Langfuse library not installed.")
     Langfuse = None
+
+
+# ==========================================
+# REUSABLE EVALUATION HELPERS
+# ==========================================
+
+def clean_text(value: Any) -> str:
+    """Converts input values into clean, whitespace-stripped strings [1]."""
+    return str(value).strip() if value is not None else ""
+
+
+def canonical_category(value: Any) -> str:
+    """Maps varied category spelling structures to standard class designations [1]."""
+    raw = clean_text(value)
+    key = raw.lower().replace("_", "").replace(" ", "")
+    mapping = {
+        "varatingdecision": "VA_Rating_Decision",
+        "vafeeletter": "VA_Fee_Letter",
+        "other": "Others",
+        "others": "Others",
+    }
+    return mapping.get(key, raw)
+
+
+def extract_filename(path_value: Any) -> str:
+    """Extract filename from a path/url-like value."""
+    raw = clean_text(path_value)
+    if not raw:
+        return ""
+    # Handle url-like paths and plain filesystem paths.
+    normalized = raw.replace("\\", "/")
+    return Path(normalized).name
+
+
+def normalize_compare(val1: str, val2: str) -> bool:
+    """Performs case-insensitive and whitespace-insensitive string matching [1]."""
+    return val1.strip().lower() == val2.strip().lower()
+
+
+def is_prediction_correct(gen_cat: str, gen_sub: str, user_cat: str, user_sub: str) -> bool:
+    """
+    Evaluates whether an individual transaction's prediction was correct [1].
+    - True if the user didn't make modifications (fields are empty) [1].
+    - True if the user's manual adjustments match the AI's prediction exactly [1].
+    - False otherwise [1].
+    """
+    if not user_cat.strip() and not user_sub.strip():
+        return True
+    return normalize_compare(user_cat, gen_cat) and normalize_compare(user_sub, gen_sub)
 
 
 def _mask_value(val: Optional[str]) -> str:
@@ -526,7 +579,7 @@ def _save_checkpoint_to_langfuse(checkpoint_dataset_name: str, langfuse_environm
             description=f"Tabak accuracy checkpoint ({langfuse_environment})"
         )
         
-        checkpoint_item_id = f"checkpoint::id::{last_id}"
+        checkpoint_item_id = f"{checkpoint_dataset_name}::checkpoint::id::{last_id}"
         checkpoint_payload = {
             "last_id": last_id,
             "saved_at": datetime.now(timezone.utc).isoformat(),
@@ -543,6 +596,55 @@ def _save_checkpoint_to_langfuse(checkpoint_dataset_name: str, langfuse_environm
         logging.info(f"[Langfuse] SUCCESS: Checkpoint saved with last_id='{last_id}'")
     except Exception as ex:
         logging.error(f"[Langfuse] FAILURE: {ex}", exc_info=True)
+        raise ex
+
+
+def _save_predictions_to_langfuse(predictions_dataset_name: str, langfuse_environment: str, records: List[Dict[str, Any]]) -> None:
+    """Save processed prediction metadata directly to a dedicated dataset on Langfuse."""
+    logging.info(f"[Langfuse] Saving {len(records)} prediction items to dataset '{predictions_dataset_name}'...")
+    try:
+        langfuse = _get_langfuse_client()
+    except Exception as init_err:
+        logging.error(f"[Langfuse] Cannot connect to Langfuse client: {init_err}")
+        raise init_err
+
+    try:
+        langfuse.create_dataset(
+            name=predictions_dataset_name,
+            description=f"Tabak accuracy predictions ({langfuse_environment})"
+        )
+
+        for record in records:
+            record_id = record["id"]
+            item_id = f"{predictions_dataset_name}::prediction::id::{record_id}"
+
+            payload = {
+                "id": record_id,
+                "filename": record["filename"],
+                "gencat": record["gencat"],
+                "gen sub category": record["gen sub category"],
+                "actual category": record["actual category"],
+                "subcategory": record["subcategory"],
+                "is_correct": record["is_correct"],
+                "date_created": record["date_created"]
+            }
+
+            logging.debug(f"[Langfuse] Uploading prediction item '{item_id}' to dataset '{predictions_dataset_name}'...")
+            langfuse.create_dataset_item(
+                dataset_name=predictions_dataset_name,
+                id=item_id,
+                input=payload,
+                metadata={
+                    "record_type": "tabak_prediction",
+                    "environment": langfuse_environment,
+                    "saved_at": datetime.now(timezone.utc).isoformat()
+                }
+            )
+
+        langfuse.flush()
+        logging.info(f"[Langfuse] SUCCESS: Saved {len(records)} items to predictions dataset '{predictions_dataset_name}'")
+    except Exception as ex:
+        logging.error(f"[Langfuse] FAILURE: Error updating predictions dataset: {ex}", exc_info=True)
         raise ex
 
 
@@ -618,6 +720,15 @@ def tabak_data_push(ids_per_message: Optional[int] = None, max_messages_per_run:
         raise ValueError("LANGFUSE_ENVIRONMENT must be set.")
     
     checkpoint_dataset_name = f"tabak_accuracy_checkpoint_{langfuse_environment}"
+
+    # Predictions Dataset Toggle & Name Setup
+    save_predictions_dataset_str = os.getenv("SAVE_PREDICTIONS_DATASET", "TRUE").strip().upper()
+    save_predictions_dataset = save_predictions_dataset_str in ("TRUE", "1", "YES")
+    predictions_dataset_name = f"tabak_predictions_{langfuse_environment}"
+    logging.info(f"[Config] Save Predictions Dataset Enabled: {save_predictions_dataset}")
+    if save_predictions_dataset:
+        logging.info(f"[Config] Derived Predictions Dataset Name: '{predictions_dataset_name}'")
+
     queue_name = os.getenv("SERVICE_BUS_QUEUE_NAME", "").strip()
     if not queue_name:
         raise ValueError("SERVICE_BUS_QUEUE_NAME must be set.")
@@ -672,8 +783,27 @@ def tabak_data_push(ids_per_message: Optional[int] = None, max_messages_per_run:
     where_clause = " AND ".join(filters)
     logging.info(f"[Timer Task 2] WHERE clause: {where_clause[:100]}...")
     
+    # Selecting relevant evaluation fields [1]
     query = (
-        "SELECT DISTINCT Transation_id "
+        "SELECT DISTINCT "
+        "Transation_id, "
+        "COALESCE(" 
+        "  file_name, "
+        "  JSON_UNQUOTE(JSON_EXTRACT(template_info, '$.generated_response.VADetails.file_path')), "
+        "  JSON_UNQUOTE(JSON_EXTRACT(template_info, '$.generated_response.VADetails.OriginalFile')), "
+        "  JSON_UNQUOTE(JSON_EXTRACT(template_info, '$.generated_response.vs_document')), "
+        "  JSON_UNQUOTE(JSON_EXTRACT(template_info, '$.vs_document'))" 
+        ") AS resolved_file_name, "
+        "JSON_VALUE(template_info, '$.generated_response.VADetails.Category') AS gen_cat, "
+        "JSON_VALUE(template_info, '$.generated_response.VADetails.Subcategory') AS gen_sub, "
+        "JSON_VALUE(template_info, '$.user_selected_response.VADetails.Category') AS user_cat, "
+        "JSON_VALUE(template_info, '$.user_selected_response.VADetails.Subcategory') AS user_sub, "
+        "COALESCE(" 
+        "  JSON_UNQUOTE(JSON_EXTRACT(template_info, '$.generated_response.VADetails.FilingDate')), "
+        "  JSON_UNQUOTE(JSON_EXTRACT(template_info, '$.generated_response.VADetails.scan_date')), "
+        "  JSON_UNQUOTE(JSON_EXTRACT(template_info, '$.generated_response.date_created')), "
+        "  JSON_UNQUOTE(JSON_EXTRACT(template_info, '$.date_created'))" 
+        ") AS db_date_created "
         "FROM `Transactions` "
         f"WHERE {where_clause} "
         "ORDER BY Transation_id ASC;"
@@ -694,8 +824,44 @@ def tabak_data_push(ids_per_message: Optional[int] = None, max_messages_per_run:
             cursor = conn.cursor()
             cursor.execute(query, query_params)
             rows = cursor.fetchall()
-            unique_keys = [str(row[0]).strip() for row in rows if row[0] is not None]
-            logging.info(f"[Timer Task 2] Retrieved {len(unique_keys)} unique IDs.")
+            
+            records = []
+            for row in rows:
+                if row[0] is not None:
+                    # Column parsing and cleaning
+                    t_id = str(row[0]).strip()
+                    fname = extract_filename(row[1])
+                    raw_gen_cat = str(row[2]).strip() if row[2] is not None else ""
+                    raw_gen_sub = str(row[3]).strip() if row[3] is not None else ""
+                    raw_user_cat = str(row[4]).strip() if row[4] is not None else ""
+                    raw_user_sub = str(row[5]).strip() if row[5] is not None else ""
+                    db_date_created = str(row[6]).strip() if row[6] is not None else ""
+
+                    # Normalization mappings [1]
+                    gencat = canonical_category(raw_gen_cat)
+                    gen_sub = clean_text(raw_gen_sub)
+                    user_cat = canonical_category(raw_user_cat)
+                    user_sub = clean_text(raw_user_sub)
+
+                    # Compute fallback values for ground truth representations [1]
+                    actual_cat = user_cat if user_cat.strip() else gencat
+                    actual_sub = user_sub if user_sub.strip() else gen_sub
+
+                    # Correctness calculation [1]
+                    is_correct = is_prediction_correct(gencat, gen_sub, user_cat, user_sub)
+
+                    records.append({
+                        "id": t_id,
+                        "filename": fname,
+                        "gencat": gencat,
+                        "gen sub category": gen_sub,
+                        "actual category": actual_cat,
+                        "subcategory": actual_sub,
+                        "is_correct": is_correct,
+                        "date_created": db_date_created or datetime.now(timezone.utc).isoformat()
+                    })
+
+            logging.info(f"[Timer Task 2] Retrieved {len(records)} unique records.")
     except Exception as e:
         logging.error(f"[Timer Task 2] FAILURE: Database query failed: {e}", exc_info=True)
         raise e
@@ -703,15 +869,15 @@ def tabak_data_push(ids_per_message: Optional[int] = None, max_messages_per_run:
     # ==========================================
     # STEP 4: Check if empty
     # ==========================================
-    if len(unique_keys) == 0:
+    if len(records) == 0:
         logging.info("[Timer Task 2] No new records. Done.")
         return
     
     # ==========================================
-    # STEP 5: Batch IDs
+    # STEP 5: Batch records
     # ==========================================
-    logging.info("[Timer Task 2] Step 5: Batching IDs...")
-    chunks = [unique_keys[i:i + eff_ids_per_message] for i in range(0, len(unique_keys), eff_ids_per_message)]
+    logging.info("[Timer Task 2] Step 5: Batching records...")
+    chunks = [records[i:i + eff_ids_per_message] for i in range(0, len(records), eff_ids_per_message)]
     
     is_capped = False
     if len(chunks) > eff_max_messages_per_run:
@@ -727,8 +893,10 @@ def tabak_data_push(ids_per_message: Optional[int] = None, max_messages_per_run:
     logging.info("[Timer Task 2] Step 6: Formatting messages...")
     formatted_messages = []
     for chunk in chunks:
+        # Service Bus messages only expect a list of record IDs
+        chunk_ids = [r["id"] for r in chunk]
         payload = {
-            "record_ids": chunk,
+            "record_ids": chunk_ids,
             "source": "tabak",
             "environment": langfuse_environment,
             "process_type": "Accuracy",
@@ -736,7 +904,7 @@ def tabak_data_push(ids_per_message: Optional[int] = None, max_messages_per_run:
         }
         formatted_messages.append(json.dumps(payload))
     
-    last_dispatched_id = chunks[-1][-1]
+    last_dispatched_id = chunks[-1][-1]["id"]
     logging.info(f"[Timer Task 2] Last ID: '{last_dispatched_id}'")
     
     # ==========================================
@@ -750,7 +918,7 @@ def tabak_data_push(ids_per_message: Optional[int] = None, max_messages_per_run:
         raise e
     
     # ==========================================
-    # STEP 8: Save checkpoint
+    # STEP 8: Save checkpoint and optional dataset to Langfuse
     # ==========================================
     logging.info("[Timer Task 2] Step 8: Saving checkpoint...")
     if is_capped:
@@ -761,6 +929,18 @@ def tabak_data_push(ids_per_message: Optional[int] = None, max_messages_per_run:
     except Exception as e:
         logging.error(f"[Timer Task 2] FAILURE: Checkpoint save failed: {e}", exc_info=True)
         raise e
+
+    # Optional Prediction Dataset Sync
+    if save_predictions_dataset:
+        dispatched_records = [rec for chunk in chunks for rec in chunk]
+        logging.info(f"[Timer Task 2] Saving {len(dispatched_records)} items to predictions dataset '{predictions_dataset_name}'...")
+        try:
+            _save_predictions_to_langfuse(predictions_dataset_name, langfuse_environment, dispatched_records)
+        except Exception as e:
+            logging.error(f"[Timer Task 2] FAILURE: Predictions dataset save failed: {e}", exc_info=True)
+            raise e
+    else:
+        logging.info("[Timer Task 2] Predictions dataset generation disabled (SAVE_PREDICTIONS_DATASET not set to TRUE).")
     
     logging.info("=============================================================")
     logging.info("[Timer Task 2] SUCCESS: Tabak workflow completed.")
