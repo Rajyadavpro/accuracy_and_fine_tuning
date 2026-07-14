@@ -31,3 +31,12 @@ Thumbs.db
 fine_tuning/EOB_Fine_Tuning_data/*.json
 fetched_messages/
 check_json.py
+schema_output/
+New_Aux/
+combine.py
+project_structure.json
+accuracy1
+accuracy2
+accuracy_calc
+
+

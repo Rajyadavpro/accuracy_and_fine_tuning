@@ -1115,10 +1115,10 @@ def _save_checkpoint_to_langfuse(checkpoint_dataset_name: str, last_allocation_i
             name=checkpoint_dataset_name,
             description="Superbill Fine Tuning checkpoint"
         )
-        checkpoint_item_id = f"checkpoint::id::{last_allocation_id}"
+        
+        # Omitted the custom 'id' argument to let Langfuse generate a unique UUID automatically
         langfuse.create_dataset_item(
             dataset_name=checkpoint_dataset_name,
-            id=checkpoint_item_id,
             input={"last_allocation_id": last_allocation_id, "saved_at": dt.datetime.now(dt.timezone.utc).isoformat()},
             metadata={"record_type": "superbill_finetuning_checkpoint", "last_allocation_id": last_allocation_id}
         )
@@ -1127,7 +1127,6 @@ def _save_checkpoint_to_langfuse(checkpoint_dataset_name: str, last_allocation_i
         logging.info(f"[Langfuse] SUCCESS: Checkpoint saved with last_allocation_id='{last_allocation_id}'")
     except Exception as ex:
         logging.error(f"[Langfuse] Checkpoint save failed: {ex}")
-
 
 # ---------------------------------------------------------------------------
 # Config helpers (adapted from EOB with default fallbacks)

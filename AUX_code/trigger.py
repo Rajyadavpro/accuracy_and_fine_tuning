@@ -47,15 +47,15 @@ if __name__ == "__main__":
     print("Starting sequential task execution...")
 
     # ACCURACY SCRIPTS
-    # trigger_task("1", "IDP Accuracy")
-    # trigger_task("2", "Tabak Accuracy")
-    # trigger_task("3", "Healthcare EOB Accuracy")
-    # trigger_task("4", "Healthcare Superbill Accuracy")
+    trigger_task("1", "IDP Accuracy")
+    trigger_task("2", "Tabak Accuracy")
+    trigger_task("3", "Healthcare EOB Accuracy")
+    trigger_task("4", "Healthcare Superbill Accuracy")
 
     # # FINE TUNING DATA PUSH SCRIPTS
-    # trigger_task("5", "Tabak Fine Tuning")
-    # trigger_task("6", "EOB Fine Tuning")
-    # trigger_task("7", "Superbill Fine Tuning")
+    trigger_task("5", "Tabak Fine Tuning")
+    trigger_task("6", "EOB Fine Tuning")
+    trigger_task("7", "Superbill Fine Tuning")
     trigger_task("8", "IDP Fine Tuning Data Push")
 
 

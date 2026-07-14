@@ -631,15 +631,14 @@ def _save_checkpoint_to_langfuse(checkpoint_dataset_name: str, langfuse_environm
             description=f"Tabak Fine Tuning checkpoint ({langfuse_environment})"
         )
         
-        checkpoint_item_id = f"checkpoint::id::{last_id}"
         checkpoint_payload = {
             "last_id": last_id,
             "saved_at": datetime.now(timezone.utc).isoformat(),
         }
         
+        # Omitted the custom 'id' argument to let Langfuse generate a unique UUID automatically
         langfuse.create_dataset_item(
             dataset_name=checkpoint_dataset_name,
-            id=checkpoint_item_id,
             input=checkpoint_payload,
             metadata={"record_type": "tabak_finetuning_checkpoint", "last_id": last_id}
         )
@@ -649,7 +648,6 @@ def _save_checkpoint_to_langfuse(checkpoint_dataset_name: str, langfuse_environm
     except Exception as ex:
         logging.error(f"[Langfuse] FAILURE: {ex}", exc_info=True)
         raise ex
-
 
 # ==========================================
 # DATABASE UTILITIES
