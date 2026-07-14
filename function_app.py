@@ -13,7 +13,7 @@ from accuracy.healthcare_superbill_accuracy import main as run_healthcare_superb
 from fine_tuning.tabak_fine_tuning_data_get import tabak_fine_tuning_data_push
 from fine_tuning.eob_fine_tuning_data_get import eob_fine_tuning_data_push
 from fine_tuning.superbill_fine_tuning_data_get import superbill_fine_tuning_data_push
-
+from fine_tuning.idp_fine_tuning_data_get import idp_fine_tuning_data_push as run_idp_fine_tuning_data_push
 app = func.FunctionApp()
 
 # ==========================================
@@ -37,7 +37,6 @@ def main_http_trigger(req: func.HttpRequest) -> func.HttpResponse:
     task_id = req.params.get('task_id')
     ids_per_message_raw = req.params.get('ids_per_message')
     max_messages_raw = req.params.get('max_messages_per_run')
-    file_type_raw = req.params.get('file_type')
     
     body_data = {}
     try:
@@ -51,16 +50,6 @@ def main_http_trigger(req: func.HttpRequest) -> func.HttpResponse:
         ids_per_message_raw = body_data.get('ids_per_message')
     if not max_messages_raw:
         max_messages_raw = body_data.get('max_messages_per_run')
-    if not file_type_raw:
-        file_type_raw = body_data.get('file_type')
-
-    file_type = None
-    if file_type_raw is not None:
-        candidate = str(file_type_raw).strip().lower()
-        if candidate in {"both", "eob", "superbill"}:
-            file_type = candidate
-        else:
-            logging.warning(f"Invalid file_type provided: {file_type_raw}. Allowed: both|eob|superbill")
 
     # Convert values to integers safely
     ids_per_message = None
@@ -87,43 +76,41 @@ def main_http_trigger(req: func.HttpRequest) -> func.HttpResponse:
     try:
         if task_id == '1':
             logging.info("Triggering IDP Accuracy script")
-            run_idp_accuracy()  # Replaced idp_data_push() with your script
-            
+            # run_idp_accuracy(ids_per_message=ids_per_message, max_messages_per_run=max_messages_per_run)  # Replaced idp_data_push() with your script
+            run_idp_accuracy()
         elif task_id == '2':
             logging.info("Triggering Tabak Accuracy script")
             run_tabak_accuracy() # Replaced tabak_data_push() with your script
 
         elif task_id == '3':
-            if file_type == "eob":
-                os.environ["HEALTHCARE_ACCURACY_FILE_TYPE"] = file_type
-                logging.info("Triggering Healthcare EOB Accuracy script")
-                run_healthcare_eob_accuracy()
-            elif file_type == "superbill":
-                os.environ["HEALTHCARE_ACCURACY_FILE_TYPE"] = file_type
-                logging.info("Triggering Healthcare Superbill Accuracy script")
-                run_healthcare_superbill_accuracy()
-            else:
-                os.environ.pop("HEALTHCARE_ACCURACY_FILE_TYPE", None)
-                logging.info("Triggering Healthcare Accuracy script (file_type=both)")
-                run_healthcare_accuracy() # Replaced healthcare_eob_push() and healthcare_superbill_push() with your script
+            os.environ["HEALTHCARE_ACCURACY_FILE_TYPE"] = "eob"
+            logging.info("Triggering Healthcare EOB Accuracy script")
+            run_healthcare_eob_accuracy(ids_per_message=ids_per_message, max_messages_per_run=max_messages_per_run)
 
         elif task_id == '4':
+            os.environ["HEALTHCARE_ACCURACY_FILE_TYPE"] = "superbill"
+            logging.info("Triggering Healthcare Superbill Accuracy script")
+            run_healthcare_superbill_accuracy(ids_per_message=ids_per_message, max_messages_per_run=max_messages_per_run)
+
+        elif task_id == '5':
             logging.info(f"Triggering Tabak Fine Tuning data push with ids_per_message={ids_per_message}, max_messages_per_run={max_messages_per_run}")
             tabak_fine_tuning_data_push(ids_per_message=ids_per_message, max_messages_per_run=max_messages_per_run)
             
-        elif task_id == '5':
+        elif task_id == '6':
             logging.info(f"Triggering EOB Fine Tuning data push with ids_per_message={ids_per_message}, max_messages_per_run={max_messages_per_run}")
             eob_fine_tuning_data_push(ids_per_message=ids_per_message, max_messages_per_run=max_messages_per_run)
 
-        elif task_id == '6':
+        elif task_id == '7':
             logging.info(f"Triggering Superbill Fine Tuning data push with ids_per_message={ids_per_message}, max_messages_per_run={max_messages_per_run}")
             superbill_fine_tuning_data_push(ids_per_message=ids_per_message, max_messages_per_run=max_messages_per_run)
             
-        elif task_id == '7':
-            return func.HttpResponse("Task 7 not implemented yet.", status_code=501)
+        elif task_id == '8':
+            os.environ.pop("HEALTHCARE_ACCURACY_FILE_TYPE", None)
+            logging.info("Triggering Healthcare Accuracy script (both)")
+            run_idp_fine_tuning_data_push(ids_per_message=ids_per_message, max_messages_per_run=max_messages_per_run)
         else:
             return func.HttpResponse(
-                "Please provide a valid 'task_id' parameter (from 1 to 7).",
+                "Please provide a valid 'task_id' parameter (from 1 to 8).",
                 status_code=400
             )
             

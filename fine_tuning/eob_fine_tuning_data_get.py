@@ -1,24 +1,15 @@
-#!/usr/bin/env python3
+
 """
-Generate EOB fine-tuning data.
+Generate EOB fine-tuning data with Langfuse Checkpointing.
 
 For each allocation that has a rawJson:
-  1. Parse the rawJson (AI's initial extraction).
-  2. Query all related DB tables to get user-corrected values.
-  3. Overlay the DB values onto the rawJson structure –> ground truth.
-  4. Write one JSON file per PDF into EOB_Fine_Tuning_data/.
-
-Output JSON structure per file:
-{
-  "file_name": "<pdf name>",
-  "allocation_id": <int>,
-  "raw_json": { ... original AI output ... },
-  "ground_truth": { ... corrected structure ... }
-}
-
-Environment variables (same as eob_AI_mapping_check.py):
-  HEALTHCARE_AI_DB_SERVER / PORT / USERID / PASSWORD / DATABASE
-  or HEALTHCARE_AI_DB_JDBC_URL
+  1. Load the last processed allocation ID from Langfuse datasets.
+  2. Query DB for allocations > last_checkpoint_id.
+  3. Parse the rawJson (AI's initial extraction).
+  4. Query all related DB tables to get user-corrected values.
+  5. Overlay the DB values onto the rawJson structure -> ground truth.
+  6. Dispatch JSON structures to Service Bus.
+  7. Save the new highest allocation ID back to Langfuse.
 """
 
 from __future__ import annotations
@@ -29,6 +20,7 @@ import os
 import re
 import sys
 import logging
+import time
 from urllib.parse import unquote, urlparse
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
@@ -38,12 +30,96 @@ import pymysql
 from pymysql.cursors import DictCursor
 from azure.servicebus import ServiceBusClient
 
+# Try to import Langfuse gracefully for checkpoint logging
+try:
+    from langfuse import Langfuse
+    _HAS_LANGFUSE = True
+except ImportError:
+    _HAS_LANGFUSE = False
+    Langfuse = None
+
 # Ensure basic logging setup is present if executing directly outside Azure Functions
 if not logging.getLogger().handlers:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] - %(message)s")
 
+
 # ---------------------------------------------------------------------------
-# Config helpers (duplicated from EOB_AI_mapping_check with default fallbacks)
+# Langfuse Checkpoint Utilities
+# ---------------------------------------------------------------------------
+
+def _get_langfuse_client():
+    """Initialize Langfuse client exactly as Tabak does."""
+    if not _HAS_LANGFUSE:
+        return None
+
+    public_key = os.getenv("LANGFUSE_PUBLIC_KEY")
+    secret_key = os.getenv("LANGFUSE_SECRET_KEY")
+    host = os.getenv("LANGFUSE_HOST")
+
+    if not all([public_key, secret_key, host]):
+        logging.warning("[Langfuse] Missing credentials (LANGFUSE_PUBLIC_KEY, LANGFUSE_SECRET_KEY, LANGFUSE_HOST). Skipping init.")
+        return None
+
+    try:
+        return Langfuse(public_key=public_key.strip(), secret_key=secret_key.strip(), host=host.strip())
+    except Exception as e:
+        logging.error(f"[Langfuse] FAILURE initializing client: {e}")
+        return None
+
+
+def _load_checkpoint_from_langfuse(checkpoint_dataset_name: str) -> Optional[int]:
+    """Retrieve last processed allocation_id from Langfuse."""
+    logging.info(f"[Langfuse] Loading checkpoint from dataset '{checkpoint_dataset_name}'...")
+    langfuse = _get_langfuse_client()
+    if not langfuse:
+        return None
+
+    try:
+        dataset = langfuse.get_dataset(checkpoint_dataset_name)
+        if not dataset or not hasattr(dataset, 'items') or not dataset.items:
+            logging.info("[Langfuse] Dataset empty or not found. Clean start.")
+            return None
+        
+        latest_item = max(dataset.items, key=lambda r: getattr(r, 'created_at'))
+        checkpoint_data = latest_item.input
+        
+        if isinstance(checkpoint_data, dict) and "last_allocation_id" in checkpoint_data:
+            last_id = int(checkpoint_data["last_allocation_id"])
+            logging.info(f"[Langfuse] SUCCESS: Retrieved checkpoint last_allocation_id='{last_id}'")
+            return last_id
+    except Exception as ex:
+        logging.warning(f"[Langfuse] Could not retrieve checkpoint: {ex}. Starting clean.")
+    return None
+
+
+def _save_checkpoint_to_langfuse(checkpoint_dataset_name: str, last_allocation_id: int) -> None:
+    """Save last processed allocation_id to Langfuse."""
+    logging.info(f"[Langfuse] Saving checkpoint: last_allocation_id='{last_allocation_id}'...")
+    langfuse = _get_langfuse_client()
+    if not langfuse:
+        return
+
+    try:
+        langfuse.create_dataset(
+            name=checkpoint_dataset_name,
+            description="EOB Fine Tuning checkpoint"
+        )
+        checkpoint_item_id = f"checkpoint::id::{last_allocation_id}"
+        langfuse.create_dataset_item(
+            dataset_name=checkpoint_dataset_name,
+            id=checkpoint_item_id,
+            input={"last_allocation_id": last_allocation_id, "saved_at": dt.datetime.now(dt.timezone.utc).isoformat()},
+            metadata={"record_type": "eob_finetuning_checkpoint", "last_allocation_id": last_allocation_id}
+        )
+        langfuse.flush()
+        time.sleep(1) # Tiny buffer to ensure network request fires before script exit
+        logging.info(f"[Langfuse] SUCCESS: Checkpoint saved with last_allocation_id='{last_allocation_id}'")
+    except Exception as ex:
+        logging.error(f"[Langfuse] Checkpoint save failed: {ex}")
+
+
+# ---------------------------------------------------------------------------
+# Config helpers 
 # ---------------------------------------------------------------------------
 
 USE_RAW_FALLBACK_WHEN_DB_MISSING = False
@@ -77,7 +153,6 @@ def apply_env_overrides() -> Dict[str, str]:
     global STRICT_AUDIT_FAIL_ON_MISMATCH
     global DOWNLOAD_PDFS
 
-    # Determine EOB_DOWNLOAD_PDFS first (defaulting to False as requested)
     download_pdfs_raw = os.getenv("EOB_DOWNLOAD_PDFS", "").strip()
     if download_pdfs_raw:
         try:
@@ -88,7 +163,6 @@ def apply_env_overrides() -> Dict[str, str]:
     else:
         DOWNLOAD_PDFS = False
 
-    # Apply defaults for all other environment variables if not present
     USE_RAW_FALLBACK_WHEN_DB_MISSING = False
     raw_fallback = os.getenv("EOB_USE_RAW_FALLBACK_WHEN_DB_MISSING", "").strip()
     if raw_fallback:
@@ -125,7 +199,6 @@ def apply_env_overrides() -> Dict[str, str]:
     output_file = os.getenv("EOB_OUTPUT_FILE", "eob_fine_tuning.json").strip()
     pdf_output_subdir = os.getenv("EOB_PDF_OUTPUT_SUBDIR", "pdfs").strip()
 
-    # Validate Azure Connection details only if PDF downloading is explicitly requested
     if DOWNLOAD_PDFS:
         missing_storage = []
         if not os.getenv("AZURE_STORAGE_CONNECTION_STRING_HEALTHCARE_AI", "").strip():
@@ -226,20 +299,24 @@ def resolve_table_name(conn, candidates: Sequence[str]) -> str:
     raise RuntimeError(f"None of table candidates exist: {candidates}")
 
 
-def fetch_allocations(conn, table: str, allocation_id: Optional[int],
-                      max_rows: int, fetch_all: bool) -> List[Dict]:
+def fetch_allocations(conn, table: str, last_checkpoint_id: Optional[int], max_rows: int, fetch_all: bool) -> List[Dict]:
+    """Fetch allocations ordered ASCENDING, filtering by checkpoint."""
     with conn.cursor(DictCursor) as cur:
-        if allocation_id is not None:
-            cur.execute(f"SELECT * FROM {q(table)} WHERE Id=%s", (allocation_id,))
+        where_clauses = ["rawJson IS NOT NULL", "rawJson <> ''"]
+        query_params = []
+        
+        if last_checkpoint_id is not None:
+            where_clauses.append("Id > %s")
+            query_params.append(last_checkpoint_id)
+            
+        where = " AND ".join(where_clauses)
+        
+        if fetch_all:
+            cur.execute(f"SELECT * FROM {q(table)} WHERE {where} ORDER BY Id ASC", tuple(query_params))
         else:
-            where = "rawJson IS NOT NULL AND rawJson <> ''"
-            if fetch_all:
-                cur.execute(f"SELECT * FROM {q(table)} WHERE {where} ORDER BY Id DESC")
-            else:
-                cur.execute(
-                    f"SELECT * FROM {q(table)} WHERE {where} ORDER BY Id DESC LIMIT %s",
-                    (max_rows,),
-                )
+            query_params.append(max_rows)
+            cur.execute(f"SELECT * FROM {q(table)} WHERE {where} ORDER BY Id ASC LIMIT %s", tuple(query_params))
+            
         return cur.fetchall()
 
 
@@ -345,11 +422,10 @@ def try_download_pdf_for_allocation(
 
 
 # ---------------------------------------------------------------------------
-# Type formatting – DB values –> rawJson-compatible strings
+# Type formatting 
 # ---------------------------------------------------------------------------
 
 def fmt_str(v: Any) -> Optional[str]:
-    """Return a cleaned string or None."""
     if v is None:
         return None
     s = str(v).strip()
@@ -357,7 +433,6 @@ def fmt_str(v: Any) -> Optional[str]:
 
 
 def fmt_money(v: Any) -> Optional[str]:
-    """Decimal / float / int –> string like '123.45'."""
     if v is None:
         return None
     try:
@@ -368,7 +443,6 @@ def fmt_money(v: Any) -> Optional[str]:
 
 
 def fmt_date(v: Any) -> Optional[str]:
-    """date/datetime –> MM-DD-YYYY string (matches common rawJson format)."""
     if v is None:
         return None
     if isinstance(v, dt.datetime):
@@ -405,11 +479,10 @@ def fmt_status(v: Any) -> Optional[str]:
 
 
 # ---------------------------------------------------------------------------
-# Build helpers – wrap a DB value in {"value": "..."} to match rawJson shape
+# Build helpers
 # ---------------------------------------------------------------------------
 
 def ocr_node(value: Any) -> Optional[Dict[str, Any]]:
-    """Wrap a scalar into the OCR-style {'value': ...} node used in rawJson."""
     if value is None:
         return None
     return {"value": value}
@@ -434,22 +507,14 @@ def missing_section_value(original: Optional[Dict]) -> Optional[Dict]:
     return original if USE_RAW_FALLBACK_WHEN_DB_MISSING else None
 
 
-# ---------------------------------------------------------------------------
-# Ground-truth builders – one per entity, mirror the audit_allocation fields
-# ---------------------------------------------------------------------------
-
 def build_gt_allocation(db_row: Dict, original_alloc: Dict) -> Dict:
-    gt = dict(original_alloc)  # shallow copy; we overwrite mapped keys below
+    gt = dict(original_alloc)
 
-    # Direct-copy fields
     gt["File_name"] = db_row.get("File_name")
     gt["File_url"] = db_row.get("File_url")
     gt["Client"] = db_row.get("Client")
     gt["Account"] = db_row.get("Account")
-
-    # OCR-style value node
     gt["Payer"] = ocr_node_str(db_row.get("Payer"))
-
     gt["Total_No_Of_Clm_On_File"] = db_row.get("Total_No_Of_Clm_On_File")
     gt["Total_Paid_Amt_On_File"] = fmt_money(db_row.get("Total_Paid_Amt_On_File"))
     gt["Check_Date"] = fmt_date(db_row.get("Check_Date"))
@@ -574,12 +639,10 @@ def build_gt_claim(
     service_lines_by_claim_id: Dict[Any, List[Dict]],
     adjustments_by_service_line_id: Dict[Any, List[Dict]],
 ) -> Dict:
-    """Build a single Claim ground-truth dict from DB rows."""
     gt: Dict[str, Any] = {}
     if original_claim:
-        gt.update(original_claim)  # carry over unmapped keys
+        gt.update(original_claim)  
 
-    # --- Claim-level scalar fields ---
     gt["Claim_Number"]               = ocr_node_str(db_claim.get("Claim_Number"))
     gt["Claim_Total_Charge_Amt"]     = ocr_node_money(db_claim.get("Claim_Total_Charge_Amt"))
     gt["Claim_Paid_Amt"]             = ocr_node_money(db_claim.get("Claim_Paid_Amt"))
@@ -596,7 +659,6 @@ def build_gt_claim(
     gt["Admission_Date"]             = ocr_node_date(db_claim.get("Admission_Date"))
     gt["Patient_Last_Seen_Date"]     = ocr_node_date(db_claim.get("Patient_Last_Seen_Date"))
 
-    # --- Sub-entities ---
     gt["Payer"] = build_gt_payer(
         payer_by_id.get(db_claim.get("PayerId")),
         original_claim.get("Payer") if original_claim else None,
@@ -617,7 +679,6 @@ def build_gt_claim(
         original_claim.get("Claim_Diagnosis") if original_claim else None,
     )
 
-    # Service lines + nested adjustments
     db_sls = service_lines_by_claim_id.get(claim_id, [])
     gt_sls = []
     for db_sl in db_sls:
@@ -629,7 +690,7 @@ def build_gt_claim(
 
 
 # ---------------------------------------------------------------------------
-# JSON serializer for Decimal / date / datetime
+# JSON serializer 
 # ---------------------------------------------------------------------------
 
 class _Encoder(json.JSONEncoder):
@@ -662,7 +723,6 @@ def _send_eob_records_to_queue(
     max_messages_per_run: Optional[int],
     progress_log_batch_size: int = 10,
 ) -> int:
-    """Send EOB fine-tuning records to Service Bus queue in chunked messages."""
     queue_name = os.getenv("SERVICE_BUS_QUEUE_NAME", "").strip()
     conn_string = os.getenv("SERVICE_BUS_CONNECTION_STRING", "").strip()
     
@@ -688,8 +748,6 @@ def _send_eob_records_to_queue(
         if max_messages_per_run is not None and max_messages_per_run > 0:
             chunks = chunks[:max_messages_per_run]
         
-        # Set socket_timeout to 10.0 seconds (instead of the default 0.2s)
-        # to allow enough time to write larger fine-tuning payloads.
         with client.get_queue_sender(queue_name, socket_timeout=10.0) as sender:
             for i, chunk in enumerate(chunks):
                 allocation_ids = [rec.get("allocation_id") for rec in chunk]
@@ -701,7 +759,6 @@ def _send_eob_records_to_queue(
                     }
                     for rec in chunk
                 ]
-
 
                 try:
                     body = {
@@ -731,14 +788,16 @@ def _send_eob_records_to_queue(
         logging.error(f"[Queue] Error sending to queue: {e}")
         return 0
 
+
+# ---------------------------------------------------------------------------
+# MAIN SCRIPT EXECUTION
+# ---------------------------------------------------------------------------
+
 def eob_fine_tuning_data_push(
     ids_per_message: Optional[int] = None,
     max_messages_per_run: Optional[int] = None
 ) -> None:
-    """
-    Generate EOB fine-tuning data.
-    Callable by Azure Functions triggers as well as manual standalone executions.
-    """
+    
     script_dir = os.path.dirname(os.path.abspath(__file__))
     load_dotenv_file(os.path.join(script_dir, ".env"))
     try:
@@ -769,9 +828,16 @@ def eob_fine_tuning_data_push(
         eff_ids_per_message,
         eff_max_messages_per_run,
     )
+    
+    # -----------------------------------------------------
+    # Langfuse Checkpoint Init
+    # -----------------------------------------------------
+    langfuse_environment = os.getenv("LANGFUSE_ENVIRONMENT", "exp").strip()
+    checkpoint_dataset_name = f"eob_finetuning_checkpoint_{langfuse_environment}"
+    
+    last_checkpoint_id = _load_checkpoint_from_langfuse(checkpoint_dataset_name)
 
     outdir = outdir_name if os.path.isabs(outdir_name) else os.path.join(script_dir, outdir_name)
-    # os.makedirs(outdir, exist_ok=True)
     pdf_output_dir = os.path.join(outdir, pdf_subdir)
     download_enabled = False
     container_client = None
@@ -809,7 +875,7 @@ def eob_fine_tuning_data_push(
     with conn:
         try:
             tables = {
-                "allocation":          resolve_table_name(conn, ["EOB_Allocation", "EOBAllocations"]),
+                "allocation":         resolve_table_name(conn, ["EOB_Allocation", "EOBAllocations"]),
                 "claim":               resolve_table_name(conn, ["EOB_Claim", "EOBClaims"]),
                 "payer":               resolve_table_name(conn, ["EOB_Payer", "EOBPayers"]),
                 "payee":               resolve_table_name(conn, ["EOB_Payee", "EOBPayees"]),
@@ -822,13 +888,14 @@ def eob_fine_tuning_data_push(
             logging.error(f"Table resolution error: {ex}")
             raise ex
 
-        # Fetch enough rows to fill the requested number of outbound messages.
         fetch_all = eff_max_messages_per_run is None
         max_rows = (eff_ids_per_message * eff_max_messages_per_run) if eff_max_messages_per_run is not None else 10
 
-        allocations = fetch_allocations(conn, tables["allocation"], None, max_rows, fetch_all)
+        # Fetch using our new checkpoint-aware DB query
+        allocations = fetch_allocations(conn, tables["allocation"], last_checkpoint_id, max_rows, fetch_all)
+        
         if not allocations:
-            logging.info("No allocations found with rawJson.")
+            logging.info("No allocations found matching the current checkpoint.")
             return
 
         written = 0
@@ -839,7 +906,7 @@ def eob_fine_tuning_data_push(
         failed_pdfs = 0
         outputs: List[Dict[str, Any]] = []
 
-        for alloc_row in sorted(allocations, key=lambda r: r.get("Id") or 0, reverse=True):
+        for alloc_row in sorted(allocations, key=lambda r: r.get("Id") or 0, reverse=False):
             alloc_id = alloc_row.get("Id")
 
             if download_enabled and container_client is not None:
@@ -877,10 +944,8 @@ def eob_fine_tuning_data_push(
                 skipped += 1
                 continue
 
-            # --- Build ground-truth Allocation ---
             gt_alloc = build_gt_allocation(alloc_row, original_alloc)
 
-            # --- Build ground-truth Claims ---
             original_claims = []
             for ci in original_alloc.get("Claims_Info") or []:
                 if isinstance(ci, dict) and isinstance(ci.get("Claim"), dict):
@@ -947,7 +1012,6 @@ def eob_fine_tuning_data_push(
             if has_mismatch:
                 audit_mismatches += 1
 
-            # --- Assemble output ---
             output = {
                 "file_name": file_name,
                 "allocation_id": alloc_id,
@@ -959,15 +1023,21 @@ def eob_fine_tuning_data_push(
             written += 1
             logging.info(f"  OK AllocationId={alloc_id}")
 
-        outputs.sort(key=lambda item: item.get("allocation_id") or 0, reverse=True)
+        outputs.sort(key=lambda item: item.get("allocation_id") or 0, reverse=False)
         
-        # Send records to Service Bus queue for downstream processing
+        # -----------------------------------------------------
+        # Dispatch & Save Final Checkpoint
+        # -----------------------------------------------------
         if outputs:
             queue_count = _send_eob_records_to_queue(
                 outputs,
                 ids_per_message=eff_ids_per_message,
                 max_messages_per_run=eff_max_messages_per_run,
             )
+            last_dispatched_id = outputs[-1].get("allocation_id")
+            
+            if _HAS_LANGFUSE and last_dispatched_id:
+                _save_checkpoint_to_langfuse(checkpoint_dataset_name, last_dispatched_id)
         else:
             queue_count = 0
 

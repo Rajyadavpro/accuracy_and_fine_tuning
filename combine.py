@@ -69,7 +69,7 @@ if __name__ == "__main__":
         "AUX_code",
         "combine.py",
         "project_structure.json" ,
-        "fine_tuning",
+        
         "New_Aux",
         "accuracy_calc",
         # Ignore the output JSON file itself

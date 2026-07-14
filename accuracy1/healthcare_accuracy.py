@@ -69,51 +69,7 @@ IGNORED_MISMATCH_SNIPPETS = (
     "Allocation.Completed_Date mismatch.",
     ".Payer count mismatch.",
 )
-import os
-import json
-from azure.storage.blob import BlobServiceClient
 
-# Load container names from environment variables (or define them directly here)
-EOB_CONTAINER = os.getenv("EOB_CONTAINER")
-SUPERBILL_CONTAINER = os.getenv("SUPERBILL_CONTAINER")
-AZURE_CONN_STR = os.getenv("AZURE_STORAGE_CONNECTION_STRING")
-
-def upload_to_blob(container_name: str, base_filename: str, raw_json: str, ground_truth: dict) -> None:
-    """
-    Uploads raw JSON and ground truth JSON to Azure Blob Storage.
-    """
-    if not AZURE_CONN_STR:
-        _log("[Azure] Missing AZURE_STORAGE_CONNECTION_STRING. Skipping blob upload.")
-        return
-
-    try:
-        blob_service_client = BlobServiceClient.from_connection_string(AZURE_CONN_STR)
-        container_client = blob_service_client.get_container_client(container_name)
-        
-        # Ensure container exists
-        if not container_client.exists():
-            container_client.create_container()
-
-        # Sanitize filename (removes extension if it exists so we can append cleanly)
-        safe_name = os.path.splitext(base_filename)[0] if base_filename else "unknown_file"
-
-        # 1. Upload Raw JSON
-        raw_blob_name = f"{safe_name}_rawjson.json"
-        raw_blob_client = container_client.get_blob_client(raw_blob_name)
-        # Assuming raw_json is already a string; if it's a dict, use json.dumps()
-        raw_blob_client.upload_blob(raw_json, overwrite=True)
-        
-        # 2. Upload Ground Truth
-        gt_blob_name = f"{safe_name}_groundtruth.json"
-        gt_blob_client = container_client.get_blob_client(gt_blob_name)
-        # Convert ground truth dict to formatted JSON string
-        gt_json_str = json.dumps(ground_truth, indent=2, default=str)
-        gt_blob_client.upload_blob(gt_json_str, overwrite=True)
-        
-        _log(f"[Azure] Successfully uploaded {raw_blob_name} and {gt_blob_name} to {container_name}")
-
-    except Exception as e:
-        _log(f"[Azure] Failed to upload blobs for {base_filename}: {e}")
 
 @dataclass
 class DbConfig:
