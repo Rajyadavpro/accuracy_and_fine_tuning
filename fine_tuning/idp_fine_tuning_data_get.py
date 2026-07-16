@@ -449,12 +449,12 @@
 Generate IDP fine-tuning data with Langfuse Checkpointing.
 
 For each record in the MS SQL view `dbo.vw_PdfClassificationTransactionLog`:
-  1. Load the last processed classification transaction ID from Langfuse datasets.
+    1. Load the last processed classification transaction ID from ClickHouse.
   2. Query DB for records with ID > last_checkpoint_id.
   3. Parse the ResponsePayload (AI's extraction metadata and ground truth).
   4. Extract file name, client code, and prediction from the payload.
   5. Dispatch formatted payloads to the Service Bus queue.
-  6. Save the new highest processed ID back to Langfuse.
+    6. Save the new highest processed ID back to ClickHouse.
 """
 
 import os
@@ -471,6 +471,8 @@ try:
 except ImportError:
     ServiceBusClient = None
     ServiceBusMessage = None
+
+from clickhouse_store import IDP_FINETUNING_CHECKPOINT_TABLE, get_environment, load_checkpoint_int, save_checkpoint_int
 
 # Load dotenv if available to match accuracy and downstream environment loading
 try:
@@ -517,14 +519,6 @@ if file_write_success:
     logging.info(f"Log file: {LOG_FILE_PATH}")
 logging.info("=============================================================")
 
-try:
-    from langfuse import Langfuse
-    logging.info("[Langfuse] Library imported successfully.")
-except ImportError:
-    logging.error("[Langfuse] FAILURE: Langfuse library not installed.")
-    Langfuse = None
-
-
 def _mask_value(val: Optional[str]) -> str:
     """Masks secret values in logs."""
     if not val:
@@ -546,95 +540,34 @@ def _extract_filename(path_value: str) -> str:
 
 
 # ==========================================
-# LANGFUSE CLIENT & CHECKPOINT UTILITIES
+# CLICKHOUSE CHECKPOINT UTILITIES
 # ==========================================
-
-def _get_langfuse_client():
-    """Initialize Langfuse client."""
-    logging.info("[Langfuse] Initializing client...")
-    
-    if not Langfuse:
-        raise ImportError("Langfuse library is not installed.")
-
-    public_key = os.getenv("LANGFUSE_PUBLIC_KEY")
-    secret_key = os.getenv("LANGFUSE_SECRET_KEY")
-    host = os.getenv("LANGFUSE_HOST")
-
-    logging.info(f"[Langfuse] Config: PK={_mask_value(public_key)}, SK={_mask_value(secret_key)}, Host={host}")
-
-    if not all([public_key, secret_key, host]):
-        raise ValueError("Missing Langfuse credentials: LANGFUSE_PUBLIC_KEY, LANGFUSE_SECRET_KEY, LANGFUSE_HOST")
-
-    try:
-        client = Langfuse(public_key=public_key.strip(), secret_key=secret_key.strip(), host=host.strip())
-        logging.info("[Langfuse] SUCCESS: Client initialized.")
-        return client
-    except Exception as e:
-        logging.error(f"[Langfuse] FAILURE: {e}", exc_info=True)
-        raise e
 
 
 def _load_checkpoint_from_langfuse(checkpoint_dataset_name: str) -> Optional[int]:
-    """Retrieve last processed ID from Langfuse."""
-    logging.info(f"[Langfuse] Loading checkpoint from dataset '{checkpoint_dataset_name}'...")
+    """Retrieve last processed ID from ClickHouse."""
+    logging.info(f"[ClickHouse] Loading checkpoint from table '{checkpoint_dataset_name}'...")
     try:
-        langfuse = _get_langfuse_client()
-    except Exception as init_err:
-        logging.warning(f"[Langfuse] Could not initialize client: {init_err}. Starting clean.")
-        return None
-
-    try:
-        dataset = langfuse.get_dataset(checkpoint_dataset_name)
-        if not dataset or not hasattr(dataset, 'items') or not dataset.items:
-            logging.info("[Langfuse] Dataset empty or not found. Clean start.")
+        last_id = load_checkpoint_int(IDP_FINETUNING_CHECKPOINT_TABLE, get_environment())
+        if last_id is None:
+            logging.info("[ClickHouse] Checkpoint table empty. Clean start.")
             return None
-        
-        latest_item = max(dataset.items, key=lambda r: getattr(r, 'created_at'))
-        checkpoint_data = latest_item.input
-        
-        if isinstance(checkpoint_data, dict) and "last_id" in checkpoint_data:
-            last_id = int(checkpoint_data["last_id"])
-            logging.info(f"[Langfuse] SUCCESS: Retrieved checkpoint last_id='{last_id}'")
-            return last_id
-        else:
-            logging.error(f"[Langfuse] Checkpoint payload invalid: {checkpoint_data}")
+        logging.info(f"[ClickHouse] SUCCESS: Retrieved checkpoint last_id='{last_id}'")
+        return last_id
     except Exception as ex:
-        logging.warning(f"[Langfuse] Could not retrieve checkpoint: {ex}")
+        logging.warning(f"[ClickHouse] Could not retrieve checkpoint: {ex}")
     
     return None
 
 
 def _save_checkpoint_to_langfuse(checkpoint_dataset_name: str, langfuse_environment: str, last_id: int) -> None:
-    """Save last processed ID to Langfuse."""
-    logging.info(f"[Langfuse] Saving checkpoint: last_id='{last_id}'...")
+    """Save last processed ID to ClickHouse."""
+    logging.info(f"[ClickHouse] Saving checkpoint: last_id='{last_id}'...")
     try:
-        langfuse = _get_langfuse_client()
-    except Exception as init_err:
-        logging.error(f"[Langfuse] Cannot save checkpoint: {init_err}")
-        raise init_err
-
-    try:
-        langfuse.create_dataset(
-            name=checkpoint_dataset_name,
-            description=f"IDP Fine Tuning checkpoint ({langfuse_environment})"
-        )
-        
-        checkpoint_payload = {
-            "last_id": last_id,
-            "saved_at": datetime.now(timezone.utc).isoformat(),
-        }
-        
-        # Omitted the custom 'id' argument to let Langfuse generate a unique UUID
-        langfuse.create_dataset_item(
-            dataset_name=checkpoint_dataset_name,
-            input=checkpoint_payload,
-            metadata={"record_type": "idp_finetuning_checkpoint", "last_id": last_id}
-        )
-        
-        langfuse.flush()
-        logging.info(f"[Langfuse] SUCCESS: Checkpoint saved with last_id='{last_id}'")
+        save_checkpoint_int(IDP_FINETUNING_CHECKPOINT_TABLE, get_environment(), last_id)
+        logging.info(f"[ClickHouse] SUCCESS: Checkpoint saved with last_id='{last_id}'")
     except Exception as ex:
-        logging.error(f"[Langfuse] FAILURE: {ex}", exc_info=True)
+        logging.error(f"[ClickHouse] FAILURE: {ex}", exc_info=True)
         raise ex
 
 # ==========================================

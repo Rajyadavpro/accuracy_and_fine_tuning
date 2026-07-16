@@ -1008,16 +1008,16 @@
 
 #!/usr/bin/env python3
 """
-Generate Superbill fine-tuning data with Langfuse Checkpointing.
+Generate Superbill fine-tuning data with ClickHouse checkpointing.
 
 For each Superbill allocation that has a RawJson:
-  1. Load the last processed allocation ID from Langfuse datasets.
+    1. Load the last processed allocation ID from ClickHouse.
   2. Query DB for allocations > last_checkpoint_id.
   3. Parse the RawJson (AI's initial extraction).
   4. Query all related DB tables to get user-corrected values.
   5. Overlay the DB values onto the RawJson structure –> ground truth.
   6. Dispatch JSON structures to Service Bus.
-  7. Save the new highest allocation ID back to Langfuse.
+    7. Save the new highest allocation ID back to ClickHouse.
 
 Environment variables:
   HEALTHCARE_AI_DB_SERVER / PORT / USERID / PASSWORD / DATABASE
@@ -1042,91 +1042,40 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 import pymysql
 from pymysql.cursors import DictCursor
 
-# Try to import Langfuse gracefully for checkpoint logging
-try:
-    from langfuse import Langfuse
-    _HAS_LANGFUSE = True
-except ImportError:
-    _HAS_LANGFUSE = False
-    Langfuse = None
+from clickhouse_store import SUPERBILL_FINETUNING_CHECKPOINT_TABLE, get_environment, load_checkpoint_int, save_checkpoint_int
 
 # Ensure basic logging setup is present if executing directly outside Azure Functions
 if not logging.getLogger().handlers:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] - %(message)s")
 
 # ---------------------------------------------------------------------------
-# Langfuse Checkpoint Utilities
+# ClickHouse Checkpoint Utilities
 # ---------------------------------------------------------------------------
-
-def _get_langfuse_client():
-    """Initialize Langfuse client exactly as Tabak does."""
-    if not _HAS_LANGFUSE:
-        return None
-
-    public_key = os.getenv("LANGFUSE_PUBLIC_KEY")
-    secret_key = os.getenv("LANGFUSE_SECRET_KEY")
-    host = os.getenv("LANGFUSE_HOST")
-
-    if not all([public_key, secret_key, host]):
-        logging.warning("[Langfuse] Missing credentials. Skipping initialization.")
-        return None
-
-    try:
-        return Langfuse(public_key=public_key.strip(), secret_key=secret_key.strip(), host=host.strip())
-    except Exception as e:
-        logging.error(f"[Langfuse] FAILURE initializing client: {e}")
-        return None
 
 
 def _load_checkpoint_from_langfuse(checkpoint_dataset_name: str) -> Optional[int]:
-    """Retrieve last processed allocation_id from Langfuse."""
-    logging.info(f"[Langfuse] Loading checkpoint from dataset '{checkpoint_dataset_name}'...")
-    langfuse = _get_langfuse_client()
-    if not langfuse:
-        return None
-
+    """Retrieve last processed allocation_id from ClickHouse."""
+    logging.info(f"[ClickHouse] Loading checkpoint from table '{checkpoint_dataset_name}'...")
     try:
-        dataset = langfuse.get_dataset(checkpoint_dataset_name)
-        if not dataset or not hasattr(dataset, 'items') or not dataset.items:
-            logging.info("[Langfuse] Dataset empty or not found. Clean start.")
+        last_id = load_checkpoint_int(SUPERBILL_FINETUNING_CHECKPOINT_TABLE, get_environment())
+        if last_id is None:
+            logging.info("[ClickHouse] Checkpoint table empty. Clean start.")
             return None
-        
-        latest_item = max(dataset.items, key=lambda r: getattr(r, 'created_at'))
-        checkpoint_data = latest_item.input
-        
-        if isinstance(checkpoint_data, dict) and "last_allocation_id" in checkpoint_data:
-            last_id = int(checkpoint_data["last_allocation_id"])
-            logging.info(f"[Langfuse] SUCCESS: Retrieved checkpoint last_allocation_id='{last_id}'")
-            return last_id
+        logging.info(f"[ClickHouse] SUCCESS: Retrieved checkpoint last_allocation_id='{last_id}'")
+        return last_id
     except Exception as ex:
-        logging.warning(f"[Langfuse] Could not retrieve checkpoint: {ex}. Starting clean.")
+        logging.warning(f"[ClickHouse] Could not retrieve checkpoint: {ex}. Starting clean.")
     return None
 
 
 def _save_checkpoint_to_langfuse(checkpoint_dataset_name: str, last_allocation_id: int) -> None:
-    """Save last processed allocation_id to Langfuse."""
-    logging.info(f"[Langfuse] Saving checkpoint: last_allocation_id='{last_allocation_id}'...")
-    langfuse = _get_langfuse_client()
-    if not langfuse:
-        return
-
+    """Save last processed allocation_id to ClickHouse."""
+    logging.info(f"[ClickHouse] Saving checkpoint: last_allocation_id='{last_allocation_id}'...")
     try:
-        langfuse.create_dataset(
-            name=checkpoint_dataset_name,
-            description="Superbill Fine Tuning checkpoint"
-        )
-        
-        # Omitted the custom 'id' argument to let Langfuse generate a unique UUID automatically
-        langfuse.create_dataset_item(
-            dataset_name=checkpoint_dataset_name,
-            input={"last_allocation_id": last_allocation_id, "saved_at": dt.datetime.now(dt.timezone.utc).isoformat()},
-            metadata={"record_type": "superbill_finetuning_checkpoint", "last_allocation_id": last_allocation_id}
-        )
-        langfuse.flush()
-        time.sleep(1) # Tiny buffer to ensure network request fires before script exit
-        logging.info(f"[Langfuse] SUCCESS: Checkpoint saved with last_allocation_id='{last_allocation_id}'")
+        save_checkpoint_int(SUPERBILL_FINETUNING_CHECKPOINT_TABLE, get_environment(), last_allocation_id)
+        logging.info(f"[ClickHouse] SUCCESS: Checkpoint saved with last_allocation_id='{last_allocation_id}'")
     except Exception as ex:
-        logging.error(f"[Langfuse] Checkpoint save failed: {ex}")
+        logging.error(f"[ClickHouse] Checkpoint save failed: {ex}")
 
 # ---------------------------------------------------------------------------
 # Config helpers (adapted from EOB with default fallbacks)
@@ -2095,7 +2044,7 @@ def superbill_fine_tuning_data_push(
             )
             last_dispatched_id = outputs[-1].get("allocation_id")
             
-            if _HAS_LANGFUSE and last_dispatched_id:
+            if last_dispatched_id:
                 _save_checkpoint_to_langfuse(checkpoint_dataset_name, last_dispatched_id)
         else:
             queue_count = 0

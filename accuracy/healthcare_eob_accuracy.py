@@ -5,87 +5,86 @@ import datetime
 import pymysql
 from pymysql.cursors import DictCursor
 from azure.servicebus import ServiceBusClient, ServiceBusMessage
-from langfuse import Langfuse
+import requests
 
 # Import your existing DB resolver
 from accuracy.healthcare_accuracy import resolve_db_config, resolve_table_name
+from clickhouse_store import _get_clickhouse_config, get_environment
 
 SERVICE_BUS_CONN_STR = os.getenv("SERVICE_BUS_CONNECTION_STRING")
 SB_QUEUE_NAME = os.getenv("SERVICE_BUS_QUEUE_NAME", "accuracy-queue")
-LANGFUSE_ENVIRONMENT = os.getenv("LANGFUSE_ENVIRONMENT", "DEV").strip()
+CLICKHOUSE_ENVIRONMENT = get_environment()
+EOB_CHECKPOINT_TABLE = "eob_accuracy_checkpoint"
 
 # ---------------------------------------------------------
-# LANGFUSE CHECKPOINT HELPERS
+# CLICKHOUSE CHECKPOINT HELPERS
 # ---------------------------------------------------------
-def _get_langfuse_client() -> Langfuse | None:
-    public_key = os.getenv("LANGFUSE_PUBLIC_KEY")
-    secret_key = os.getenv("LANGFUSE_SECRET_KEY")
-    host = os.getenv("LANGFUSE_HOST", "https://cloud.langfuse.com")
+def ensure_eob_checkpoint_table(timeout: int = 10) -> bool:
+    """Create EOB checkpoint table in ClickHouse if it doesn't exist."""
+    host, http_port, database, user, password = _get_clickhouse_config()
+    url = f"http://{host}:{http_port}/"
     
-    if not public_key or not secret_key:
-        logging.warning("Missing Langfuse credentials. Checkpoint will not be saved.")
-        return None
-    return Langfuse(public_key=public_key.strip(), secret_key=secret_key.strip(), host=host.strip())
-
-def get_checkpoint_dataset_name(file_type: str) -> str:
-    # Ensures "accuracy" is in the dataset name as requested
-    return f"{file_type.lower()}_accuracy_queue_checkpoint_{LANGFUSE_ENVIRONMENT}"
+    ddl = f"""
+    CREATE TABLE IF NOT EXISTS `{database}`.`{EOB_CHECKPOINT_TABLE}` (
+        environment String,
+        file_type String,
+        last_processed_id UInt64,
+        updated_at DateTime DEFAULT now()
+    ) ENGINE = ReplacingMergeTree(updated_at)
+    ORDER BY (environment, file_type)
+    """
+    
+    try:
+        response = requests.post(url, auth=(user, password), data=ddl.encode(), timeout=timeout)
+        if response.status_code in (200, 201):
+            logging.info(f"[ClickHouse] EOB checkpoint table ready")
+            return True
+        else:
+            logging.error(f"[ClickHouse] Failed to create checkpoint table: {response.status_code} - {response.text[:200]}")
+            return False
+    except Exception as e:
+        logging.error(f"[ClickHouse] Error ensuring checkpoint table: {e}")
+        return False
 
 def get_last_processed_id(file_type: str) -> int:
-    langfuse = _get_langfuse_client()
-    if not langfuse:
-        return 0
-        
-    dataset_name = get_checkpoint_dataset_name(file_type)
-    max_id = 0
-    try:
-        dataset = langfuse.get_dataset(dataset_name)
-        for item in dataset.items:
-            payload = item.input if isinstance(item.input, dict) else {}
-            val = payload.get("last_processed_id")
-            if val:
-                try:
-                    val_int = int(val)
-                    if val_int > max_id:
-                        max_id = val_int
-                except ValueError:
-                    continue
-    except Exception:
-        # Dataset likely doesn't exist yet
-        pass
-        
-    return max_id
-
-def save_last_processed_id(file_type: str, last_id: int) -> None:
-    langfuse = _get_langfuse_client()
-    if not langfuse:
-        return
-        
-    dataset_name = get_checkpoint_dataset_name(file_type)
+    """Fetch the last processed ID from ClickHouse checkpoint table."""
+    host, http_port, database, user, password = _get_clickhouse_config()
+    url = f"http://{host}:{http_port}/"
+    
+    query = f"""
+    SELECT max(last_processed_id) as max_id FROM `{database}`.`{EOB_CHECKPOINT_TABLE}` 
+    WHERE environment = '{CLICKHOUSE_ENVIRONMENT}' AND file_type = '{file_type}'
+    """
     
     try:
-        langfuse.create_dataset(
-            name=dataset_name,
-            description=f"Checkpoint tracker for {file_type} accuracy Service Bus queue."
-        )
-    except Exception:
-        pass # Dataset already exists
-        
-    timestamp = datetime.datetime.utcnow().isoformat()
-    try:
-        langfuse.create_dataset_item(
-            dataset_name=dataset_name,
-            id=f"checkpoint::{timestamp}",
-            input={
-                "last_processed_id": last_id, 
-                "file_type": file_type, 
-                "timestamp": timestamp
-            }
-        )
-        langfuse.flush()
-        logging.info(f"[{file_type}] Langfuse checkpoint successfully updated to Id: {last_id}")
+        response = requests.get(url, auth=(user, password), params={"query": query}, timeout=10)
+        if response.status_code == 200:
+            result = response.text.strip()
+            if result and result != "0" and result != "\\N":
+                return int(result)
     except Exception as e:
-        logging.error(f"[{file_type}] Failed to save Langfuse checkpoint: {e}")
+        logging.warning(f"[ClickHouse] Error loading checkpoint: {e}")
+    
+    return 0
+
+def save_last_processed_id(file_type: str, last_id: int) -> None:
+    """Save the last processed ID to ClickHouse checkpoint table."""
+    host, http_port, database, user, password = _get_clickhouse_config()
+    url = f"http://{host}:{http_port}/"
+    
+    insert_sql = f"""
+    INSERT INTO `{database}`.`{EOB_CHECKPOINT_TABLE}` (environment, file_type, last_processed_id) 
+    VALUES ('{CLICKHOUSE_ENVIRONMENT}', '{file_type}', {last_id})
+    """
+    
+    try:
+        response = requests.post(url, auth=(user, password), data=insert_sql.encode(), timeout=30)
+        if response.status_code in (200, 201):
+            logging.info(f"[ClickHouse] Checkpoint saved: {file_type} -> Id {last_id}")
+        else:
+            logging.error(f"[ClickHouse] Failed to save checkpoint: {response.status_code} - {response.text[:200]}")
+    except Exception as e:
+        logging.error(f"[ClickHouse] Error saving checkpoint: {e}")
 
 # ---------------------------------------------------------
 # MAIN DISPATCHER
@@ -93,6 +92,11 @@ def save_last_processed_id(file_type: str, last_id: int) -> None:
 def main(ids_per_message: int | None = None, max_messages_per_run: int | None = None) -> None:
     file_type = "EOB"
     logging.info(f"[{file_type}] Starting incremental Service Bus queue dispatch...")
+    
+    # Ensure checkpoint table exists
+    if not ensure_eob_checkpoint_table():
+        logging.error(f"[{file_type}] Failed to initialize ClickHouse checkpoint table")
+        return
     
     if not SERVICE_BUS_CONN_STR:
         logging.error(f"[{file_type}] SERVICE_BUS_CONNECTION_STRING is missing.")

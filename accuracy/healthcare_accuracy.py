@@ -2,8 +2,8 @@
 """
 Standalone unified healthcare accuracy runner.
 
-Runs EOB and Superbill audits together, uploads per-allocation summaries to
-Langfuse datasets, and processes allocation ids in increasing order.
+Runs EOB and Superbill audits together, stores per-allocation summaries in
+ClickHouse, and processes allocation ids in increasing order.
 
 This file is self-contained and does not import eob_AI_mapping_check.py or
 healtcare_AI_mapping_check.py.
@@ -29,17 +29,17 @@ import pymysql
 from dotenv import load_dotenv
 from pymysql.cursors import DictCursor
 
+from clickhouse_store import HEALTHCARE_EOB_ACCURACY_TABLE, HEALTHCARE_SUPERBILL_ACCURACY_TABLE
+from clickhouse_store import get_environment, get_healthcare_dataset_state, insert_healthcare_accuracy_rows
+
 
 ENV_FILE = Path(".env")
 load_dotenv()
 
-LANGFUSE_ENVIRONMENT_RAW = os.getenv("LANGFUSE_ENVIRONMENT")
-if not LANGFUSE_ENVIRONMENT_RAW:
-    raise RuntimeError("Missing LANGFUSE_ENVIRONMENT in .env")
-LANGFUSE_ENVIRONMENT = LANGFUSE_ENVIRONMENT_RAW.strip()
+LANGFUSE_ENVIRONMENT = get_environment()
 
-EOB_DATASET_NAME = f"healthcare_accuracy_eob_{LANGFUSE_ENVIRONMENT}"
-SUPERBILL_DATASET_NAME = f"healthcare_accuracy_superbill_{LANGFUSE_ENVIRONMENT}"
+EOB_DATASET_NAME = HEALTHCARE_EOB_ACCURACY_TABLE
+SUPERBILL_DATASET_NAME = HEALTHCARE_SUPERBILL_ACCURACY_TABLE
 
 VERBOSE = True
 FILE_TYPE = "both"
@@ -48,7 +48,7 @@ PAGE_SIZE = 10
 UPLOAD_EACH_BATCH = True
 UPLOAD_EVERY_ROWS = 10
 MAX_WORKERS = 4
-# Resume from last saved allocation in Langfuse (implicit checkpoint), with a
+# Resume from last saved allocation in ClickHouse (implicit checkpoint), with a
 # small lookback window to recover near-tail misses from partial failures.
 RESUME_LOOKBACK_ALLOCATIONS = 200
 
@@ -1045,39 +1045,11 @@ def _is_allocation_already_uploaded(
     return legacy_id in processed_item_ids or stable_id in processed_item_ids
 
 
-def _get_langfuse_client():
-    from langfuse import Langfuse
-
-    public_key = os.getenv("LANGFUSE_PUBLIC_KEY")
-    secret_key = os.getenv("LANGFUSE_SECRET_KEY")
-    host = os.getenv("LANGFUSE_HOST", "https://cloud.langfuse.com")
-    if not public_key or not secret_key:
-        raise RuntimeError("Missing LANGFUSE_PUBLIC_KEY or LANGFUSE_SECRET_KEY in .env")
-
-    return Langfuse(public_key=public_key.strip(), secret_key=secret_key.strip(), host=host.strip())
-
-
 def _load_langfuse_dataset_state(dataset_name: str) -> tuple[set[str], int | None]:
-    existing_ids: set[str] = set()
-    max_allocation_id: int | None = None
     try:
-        langfuse = _get_langfuse_client()
-        dataset = langfuse.get_dataset(dataset_name)
-        for item in dataset.items:
-            item_id = getattr(item, "id", None)
-            if item_id:
-                existing_ids.add(str(item_id))
-            payload = item.input if isinstance(item.input, dict) else {}
-            allocation_id = payload.get("allocation_id")
-            try:
-                allocation_id_int = int(allocation_id)
-            except (TypeError, ValueError):
-                continue
-            if max_allocation_id is None or allocation_id_int > max_allocation_id:
-                max_allocation_id = allocation_id_int
+        return get_healthcare_dataset_state(dataset_name, LANGFUSE_ENVIRONMENT)
     except Exception:
         return set(), None
-    return existing_ids, max_allocation_id
 
 
 def _prepare_langfuse_row(row: dict[str, Any], source_name: str) -> dict[str, Any]:
@@ -1096,62 +1068,39 @@ def _prepare_langfuse_row(row: dict[str, Any], source_name: str) -> dict[str, An
 
 def _upload_rows_to_langfuse(rows: list[dict[str, Any]], dataset_name: str, source_name: str) -> bool:
     if not rows:
-        _log(f"[Langfuse] No new {source_name} rows to upload.")
+        _log(f"[ClickHouse] No new {source_name} rows to upload.")
         return True
-
-    try:
-        langfuse = _get_langfuse_client()
-    except Exception as ex:
-        print(f"[Langfuse] Client init failed; skipping upload for {source_name}. Reason: {ex}")
-        return False
-
-    try:
-        langfuse.create_dataset(
-            name=dataset_name,
-            description=f"{source_name} allocation accuracy summaries ({LANGFUSE_ENVIRONMENT})",
-        )
-    except Exception:
-        pass
 
     existing_ids = _LANGFUSE_DATASET_IDS_CACHE.get(dataset_name)
     if existing_ids is None:
         existing_ids, _ = _load_langfuse_dataset_state(dataset_name)
-        try:
-            dataset = langfuse.get_dataset(dataset_name)
-            for item in dataset.items:
-                item_id = getattr(item, "id", None)
-                if item_id:
-                    existing_ids.add(str(item_id))
-        except Exception:
-            pass
         _LANGFUSE_DATASET_IDS_CACHE[dataset_name] = existing_ids
 
-    _log(f"[Langfuse] Preparing upload for {source_name}: dataset='{dataset_name}', rows={len(rows)}")
-    uploaded = 0
+    _log(f"[ClickHouse] Preparing upload for {source_name}: table='{dataset_name}', rows={len(rows)}")
+    upload_rows: list[dict[str, Any]] = []
     for row in rows:
         allocation_id = row.get("allocation_id")
         stable_item_id = _stable_dataset_item_id(dataset_name, source_name, allocation_id)
         legacy_item_id = _legacy_dataset_item_id(source_name, allocation_id)
         if stable_item_id in existing_ids or legacy_item_id in existing_ids:
-            _log(f"[Langfuse] Skipping existing {source_name} item for allocation_id={allocation_id}")
+            _log(f"[ClickHouse] Skipping existing {source_name} item for allocation_id={allocation_id}")
             continue
         payload = _prepare_langfuse_row(row, source_name)
-        try:
-            langfuse.create_dataset_item(
-                dataset_name=dataset_name,
-                id=stable_item_id,
-                input=payload,
-                metadata={"record_type": "allocation_accuracy", "source_type": source_name},
-            )
-            existing_ids.add(stable_item_id)
-            uploaded += 1
-            _log(f"[Langfuse] Uploaded {stable_item_id} -> allocation_id={allocation_id}")
-        except Exception as ex:
-            _log(f"[Langfuse] Failed to upload {stable_item_id}: {ex}")
-            continue
+        payload["item_id"] = stable_item_id
+        payload["source_type"] = source_name
+        upload_rows.append(payload)
 
-    langfuse.flush()
-    print(f"[Langfuse] Uploaded {uploaded}/{len(rows)} records to dataset '{dataset_name}'.")
+    try:
+        uploaded = insert_healthcare_accuracy_rows(dataset_name, LANGFUSE_ENVIRONMENT, upload_rows)
+    except Exception as ex:
+        _log(f"[ClickHouse] Failed to upload rows for table '{dataset_name}': {ex}")
+        return False
+
+    for payload in upload_rows:
+        existing_ids.add(str(payload["item_id"]))
+        _log(f"[ClickHouse] Uploaded {payload['item_id']} -> allocation_id={payload['allocation_id']}")
+
+    print(f"[ClickHouse] Uploaded {uploaded}/{len(rows)} records to table '{dataset_name}'.")
     return True
 
 

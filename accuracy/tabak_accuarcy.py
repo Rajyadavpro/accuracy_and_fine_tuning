@@ -6,8 +6,8 @@ This script connects directly to a MariaDB database, extracts target audit field
 utilizing database-level JSON capabilities, and calculates the overall and class-wise 
 (TP, FP, FN) classification metrics.
 
-It supports time-period filtering (--period), persists metrics to Langfuse
-datasets, and infers incremental checkpoints from the latest saved summary row.
+It supports time-period filtering (--period), persists metrics to ClickHouse
+tables, and infers incremental checkpoints from the latest saved summary row.
 """
 
 import argparse
@@ -19,6 +19,13 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from dotenv import load_dotenv
 
+from clickhouse_store import (
+    get_environment,
+    insert_tabak_accuracy,
+    load_tabak_accuracy_checkpoint,
+    ensure_tabak_accuracy_tables,
+)
+
 # Load database credentials and config from the environment (.env file)
 ENV_PATH = Path(__file__).resolve().with_name(".env")
 load_dotenv(dotenv_path=ENV_PATH)
@@ -26,11 +33,11 @@ load_dotenv(dotenv_path=ENV_PATH)
 
 UPLOAD_TO_LANGFUSE = True
 
-LANGFUSE_ENVIRONMENT = (os.getenv("LANGFUSE_ENVIRONMENT") or "DEV").strip()
-TABAK_SUMMARY_DATASET_NAME = f"tabak_accuracy_summary_{LANGFUSE_ENVIRONMENT}"
-TABAK_DAILY_DATASET_NAME = f"tabak_accuracy_daily_{LANGFUSE_ENVIRONMENT}"
-TABAK_CATEGORY_DATASET_NAME = f"tabak_accuracy_category_{LANGFUSE_ENVIRONMENT}"
-TABAK_SUBCATEGORY_DATASET_NAME = f"tabak_accuracy_subcategory_{LANGFUSE_ENVIRONMENT}"
+LANGFUSE_ENVIRONMENT = get_environment()
+TABAK_SUMMARY_DATASET_NAME = "tabak_accuracy_summary"
+TABAK_DAILY_DATASET_NAME = "tabak_accuracy_daily"
+TABAK_CATEGORY_DATASET_NAME = "tabak_accuracy_category"
+TABAK_SUBCATEGORY_DATASET_NAME = "tabak_accuracy_subcategory"
 
 CATEGORIES = ["VA_Rating_Decision", "VA_Fee_Letter", "Others"]
 
@@ -100,13 +107,7 @@ def run_query(conn, sql: str, params: Optional[List[str]] = None):
     cursor.close()
     return rows
 
-
-# ==========================================
-# Data Processing Helpers
-# ==========================================
-
 def clean_text(value):
-    """Converts input values into clean, whitespace-stripped strings."""
     return str(value).strip() if value is not None else ""
 
 def canonical_category(value):
@@ -395,31 +396,10 @@ def _get_langfuse_client():
 
 
 def _load_checkpoint_from_langfuse() -> Optional[datetime]:
-    langfuse = _get_langfuse_client()
-    if not langfuse:
-        return None
-
     try:
-        dataset = langfuse.get_dataset(TABAK_SUMMARY_DATASET_NAME)
-        if not dataset:
-            return None
-
-        if hasattr(dataset, "items") and dataset.items:
-            latest_item = max(dataset.items, key=lambda item: getattr(item, "created_at", datetime.min))
-            checkpoint_data = getattr(latest_item, "input", None)
-            if isinstance(checkpoint_data, dict):
-                candidate = checkpoint_data.get("datetime") or checkpoint_data.get("timestamp")
-                if candidate:
-                    try:
-                        return datetime.fromisoformat(str(candidate))
-                    except (ValueError, TypeError):
-                        pass
-
-            created_at = getattr(latest_item, "created_at", None)
-            if isinstance(created_at, datetime):
-                return created_at
+        return load_tabak_accuracy_checkpoint(LANGFUSE_ENVIRONMENT)
     except Exception as ex:
-        print(f"[Langfuse] Error loading checkpoint: {ex}")
+        print(f"[ClickHouse] Error loading checkpoint: {ex}")
 
     return None
 
@@ -433,101 +413,22 @@ def _upload_to_langfuse(
     end_datetime: Optional[datetime],
     run_datetime: datetime,
 ) -> None:
-    langfuse = _get_langfuse_client()
-    if not langfuse:
-        print("[Langfuse] Client not initialized. Skipping upload.")
-        return
-
     try:
-        for dataset_name, description in [
-            (TABAK_SUMMARY_DATASET_NAME, f"Tabak accuracy summary ({LANGFUSE_ENVIRONMENT})"),
-            (TABAK_DAILY_DATASET_NAME, f"Tabak accuracy daily summary ({LANGFUSE_ENVIRONMENT})"),
-            (TABAK_CATEGORY_DATASET_NAME, f"Tabak accuracy category breakdown ({LANGFUSE_ENVIRONMENT})"),
-            (TABAK_SUBCATEGORY_DATASET_NAME, f"Tabak accuracy subcategory breakdown ({LANGFUSE_ENVIRONMENT})"),
-        ]:
-            try:
-                langfuse.create_dataset(name=dataset_name, description=description)
-            except Exception:
-                pass
-
-        summary_payload = {
-            "datetime": run_datetime.isoformat(),
-            "period": period,
-            "query_start_datetime": start_datetime.isoformat() if start_datetime else "",
-            "query_end_datetime": end_datetime.isoformat() if end_datetime else "",
-            "source_date_start": metrics["source_date_start"],
-            "source_date_end": metrics["source_date_end"],
-            "correct_predictions": int(metrics["correct"]),
-            "incorrect_predictions": int(metrics["incorrect"]),
-            "total_records": int(metrics["total"]),
-            "accuracy_pct": metrics["accuracy_pct"],
-        }
-        langfuse.create_dataset_item(
-            dataset_name=TABAK_SUMMARY_DATASET_NAME,
-            id=f"summary::{run_datetime.isoformat()}",
-            input=summary_payload,
-            metadata={
-                "record_type": "tabak_accuracy_summary",
-                "period": period,
-                "timestamp": run_datetime.isoformat(),
-            },
+        ensure_tabak_accuracy_tables()
+        insert_tabak_accuracy(
+            environment=LANGFUSE_ENVIRONMENT,
+            metrics=metrics,
+            daily_rows=daily_rows,
+            daily_category_rows=daily_category_rows,
+            daily_subcategory_rows=daily_subcategory_rows,
+            period=period,
+            start_datetime=start_datetime,
+            end_datetime=end_datetime,
+            run_datetime=run_datetime,
         )
-
-        for row in daily_rows:
-            langfuse.create_dataset_item(
-                dataset_name=TABAK_DAILY_DATASET_NAME,
-                id=f"daily::{row['source_date']}::{run_datetime.isoformat()}",
-                input={
-                    "datetime": run_datetime.isoformat(),
-                    "period": period,
-                    **row,
-                },
-                metadata={
-                    "record_type": "tabak_accuracy_daily",
-                    "source_date": row["source_date"],
-                    "period": period,
-                    "timestamp": run_datetime.isoformat(),
-                },
-            )
-
-        for row in daily_category_rows:
-            langfuse.create_dataset_item(
-                dataset_name=TABAK_CATEGORY_DATASET_NAME,
-                id=f"category::{row['source_date']}::{row['category']}::{run_datetime.isoformat()}",
-                input={
-                    "datetime": run_datetime.isoformat(),
-                    "period": period,
-                    **row,
-                },
-                metadata={
-                    "record_type": "tabak_accuracy_category",
-                    "source_date": row["source_date"],
-                    "category": row["category"],
-                    "timestamp": run_datetime.isoformat(),
-                },
-            )
-
-        for row in daily_subcategory_rows:
-            langfuse.create_dataset_item(
-                dataset_name=TABAK_SUBCATEGORY_DATASET_NAME,
-                id=f"subcategory::{row['source_date']}::{row['subcategory']}::{run_datetime.isoformat()}",
-                input={
-                    "datetime": run_datetime.isoformat(),
-                    "period": period,
-                    **row,
-                },
-                metadata={
-                    "record_type": "tabak_accuracy_subcategory",
-                    "source_date": row["source_date"],
-                    "subcategory": row["subcategory"],
-                    "timestamp": run_datetime.isoformat(),
-                },
-            )
-
-        langfuse.flush()
-        print("[Langfuse] Upload completed successfully.")
+        print("[ClickHouse] Upload completed successfully.")
     except Exception as ex:
-        print(f"[Langfuse] Error uploading results: {ex}")
+        print(f"[ClickHouse] Error uploading results: {ex}")
 
 
 # ==========================================

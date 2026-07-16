@@ -1,6 +1,7 @@
 import azure.functions as func
 import logging
 import os
+import threading
 
 # 1. Import the 'main' functions from your 3 script files, renaming them to avoid conflicts
 from accuracy.idp_accuarcy import main as run_idp_accuracy
@@ -14,6 +15,7 @@ from fine_tuning.tabak_fine_tuning_data_get import tabak_fine_tuning_data_push
 from fine_tuning.eob_fine_tuning_data_get import eob_fine_tuning_data_push
 from fine_tuning.superbill_fine_tuning_data_get import superbill_fine_tuning_data_push
 from fine_tuning.idp_fine_tuning_data_get import idp_fine_tuning_data_push as run_idp_fine_tuning_data_push
+from fine_tuning.ccai_fine_tuning_data_get import audio_fine_tuning_data_push
 app = func.FunctionApp()
 
 # ==========================================
@@ -72,56 +74,56 @@ def main_http_trigger(req: func.HttpRequest) -> func.HttpResponse:
             status_code=400
         )
 
-    # 2. Execute selected function passing the test variables
-    try:
-        if task_id == '1':
-            logging.info("Triggering IDP Accuracy script")
-            # run_idp_accuracy(ids_per_message=ids_per_message, max_messages_per_run=max_messages_per_run)  # Replaced idp_data_push() with your script
-            run_idp_accuracy()
-        elif task_id == '2':
-            logging.info("Triggering Tabak Accuracy script")
-            run_tabak_accuracy() # Replaced tabak_data_push() with your script
+    # Build the task function to run in background
+    def run_task():
+        try:
+            if task_id == '1':
+                os.environ["IDP_VERBOSE"] = "1"
+                os.environ.setdefault("IDP_LOG_LEVEL", "DEBUG")
+                logging.info("Triggering IDP Accuracy script")
+                run_idp_accuracy()
+            elif task_id == '2':
+                logging.info("Triggering Tabak Accuracy script")
+                run_tabak_accuracy()
+            elif task_id == '3':
+                os.environ["HEALTHCARE_ACCURACY_FILE_TYPE"] = "eob"
+                logging.info("Triggering Healthcare EOB Accuracy script")
+                run_healthcare_eob_accuracy(ids_per_message=ids_per_message, max_messages_per_run=max_messages_per_run)
+            elif task_id == '4':
+                os.environ["HEALTHCARE_ACCURACY_FILE_TYPE"] = "superbill"
+                logging.info("Triggering Healthcare Superbill Accuracy script")
+                run_healthcare_superbill_accuracy(ids_per_message=ids_per_message, max_messages_per_run=max_messages_per_run)
+            elif task_id == '5':
+                logging.info(f"Triggering Tabak Fine Tuning data push with ids_per_message={ids_per_message}, max_messages_per_run={max_messages_per_run}")
+                tabak_fine_tuning_data_push(ids_per_message=ids_per_message, max_messages_per_run=max_messages_per_run)
+            elif task_id == '6':
+                logging.info(f"Triggering EOB Fine Tuning data push with ids_per_message={ids_per_message}, max_messages_per_run={max_messages_per_run}")
+                eob_fine_tuning_data_push(ids_per_message=ids_per_message, max_messages_per_run=max_messages_per_run)
+            elif task_id == '7':
+                logging.info(f"Triggering Superbill Fine Tuning data push with ids_per_message={ids_per_message}, max_messages_per_run={max_messages_per_run}")
+                superbill_fine_tuning_data_push(ids_per_message=ids_per_message, max_messages_per_run=max_messages_per_run)
+            elif task_id == '8':
+                os.environ.pop("HEALTHCARE_ACCURACY_FILE_TYPE", None)
+                logging.info("Triggering IDP Fine Tuning data push")
+                run_idp_fine_tuning_data_push(ids_per_message=ids_per_message, max_messages_per_run=max_messages_per_run)
+            elif task_id == '9':
+                logging.info(f"Triggering Audio (CCAI) Fine Tuning data push with ids_per_message={ids_per_message}, max_messages_per_run={max_messages_per_run}")
+                audio_fine_tuning_data_push(ids_per_message=ids_per_message, max_messages_per_run=max_messages_per_run)
+            logging.info(f"Task {task_id} completed successfully.")
+        except Exception as e:
+            logging.error(f"Background task {task_id} failed: {e}")
 
-        elif task_id == '3':
-            os.environ["HEALTHCARE_ACCURACY_FILE_TYPE"] = "eob"
-            logging.info("Triggering Healthcare EOB Accuracy script")
-            run_healthcare_eob_accuracy(ids_per_message=ids_per_message, max_messages_per_run=max_messages_per_run)
-
-        elif task_id == '4':
-            os.environ["HEALTHCARE_ACCURACY_FILE_TYPE"] = "superbill"
-            logging.info("Triggering Healthcare Superbill Accuracy script")
-            run_healthcare_superbill_accuracy(ids_per_message=ids_per_message, max_messages_per_run=max_messages_per_run)
-
-        elif task_id == '5':
-            logging.info(f"Triggering Tabak Fine Tuning data push with ids_per_message={ids_per_message}, max_messages_per_run={max_messages_per_run}")
-            tabak_fine_tuning_data_push(ids_per_message=ids_per_message, max_messages_per_run=max_messages_per_run)
-            
-        elif task_id == '6':
-            logging.info(f"Triggering EOB Fine Tuning data push with ids_per_message={ids_per_message}, max_messages_per_run={max_messages_per_run}")
-            eob_fine_tuning_data_push(ids_per_message=ids_per_message, max_messages_per_run=max_messages_per_run)
-
-        elif task_id == '7':
-            logging.info(f"Triggering Superbill Fine Tuning data push with ids_per_message={ids_per_message}, max_messages_per_run={max_messages_per_run}")
-            superbill_fine_tuning_data_push(ids_per_message=ids_per_message, max_messages_per_run=max_messages_per_run)
-            
-        elif task_id == '8':
-            os.environ.pop("HEALTHCARE_ACCURACY_FILE_TYPE", None)
-            logging.info("Triggering Healthcare Accuracy script (both)")
-            run_idp_fine_tuning_data_push(ids_per_message=ids_per_message, max_messages_per_run=max_messages_per_run)
-        else:
-            return func.HttpResponse(
-                "Please provide a valid 'task_id' parameter (from 1 to 8).",
-                status_code=400
-            )
-            
+    if task_id not in ('1', '2', '3', '4', '5', '6', '7', '8', '9'):
         return func.HttpResponse(
-            f"Successfully triggered HTTP task {task_id}.",
-            status_code=200
+            "Please provide a valid 'task_id' parameter (from 1 to 9).",
+            status_code=400
         )
-        
-    except Exception as e:
-        logging.error(f"Error executing HTTP task: {e}")
-        return func.HttpResponse(
-            f"An error occurred while attempting to process the request: {e}",
-            status_code=500
-        )
+
+    # Start task in background thread and return immediately
+    t = threading.Thread(target=run_task, daemon=True)
+    t.start()
+    logging.info(f"Task {task_id} started in background thread.")
+    return func.HttpResponse(
+        f"Task {task_id} started successfully. Running in background.",
+        status_code=200
+    )
