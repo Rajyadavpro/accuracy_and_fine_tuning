@@ -54,11 +54,11 @@ if __name__ == "__main__":
 
     # # # FINE TUNING DATA PUSH SCRIPTS
     # Using ids_per_msg=2 for fine tuning because each record contains large JSON payload
-    trigger_task("5", "Tabak Fine Tuning", ids_per_msg=1, max_msgs=1)
-    trigger_task("6", "EOB Fine Tuning", ids_per_msg=1, max_msgs=1)
-    trigger_task("7", "Superbill Fine Tuning", ids_per_msg=1, max_msgs=1)
+    trigger_task("5", "Tabak Fine Tuning", ids_per_msg=2, max_msgs=1)
+    trigger_task("6", "EOB Fine Tuning", ids_per_msg=2, max_msgs=1)
+    trigger_task("7", "Superbill Fine Tuning", ids_per_msg=2, max_msgs=1)
     trigger_task("8", "IDP Fine Tuning Data Push", ids_per_msg=2, max_msgs=1)
-    trigger_task("9", "Audio (CCAI) Fine Tuning", ids_per_msg=1, max_msgs=1)
+    trigger_task("9", "Audio (CCAI) Fine Tuning", ids_per_msg=2, max_msgs=1)
 
 
     print("\nAll selected tasks have finished executing.")

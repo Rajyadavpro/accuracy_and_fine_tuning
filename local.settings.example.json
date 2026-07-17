@@ -1,0 +1,57 @@
+{
+  "IsEncrypted": false,
+  "Values": {
+    "FUNCTIONS_WORKER_RUNTIME": "python",
+    "AzureWebJobsFeatureFlags": "EnableWorkerIndexing",
+    "AzureWebJobsStorage": "DefaultEndpointsProtocol=https;AccountName=YOUR_ACCOUNT_NAME;AccountKey=YOUR_ACCOUNT_KEY;EndpointSuffix=core.windows.net",
+    
+    "STORAGE_ENVIRONMENT": "Dev",
+    "CLICKHOUSE_HOST": "YOUR_CLICKHOUSE_IP_OR_HOST",
+    "CLICKHOUSE_PORT": "9000",
+    "CLICKHOUSE_DATABASE": "accuracy_and_finetuning",
+    "CLICKHOUSE_USER": "YOUR_CLICKHOUSE_USER",
+    "CLICKHOUSE_PASSWORD": "YOUR_CLICKHOUSE_PASSWORD",
+
+    "IDP_SQL_SERVER": "your_sql_server.database.windows.net,1433",
+    "IDP_SQL_DATABASE": "YOUR_IDP_DATABASE",
+    "IDP_SQL_USER": "YOUR_SQL_USER",
+    "IDP_SQL_PASSWORD": "YOUR_SQL_PASSWORD",
+    "IDP_QUEUE_NAME": "ai-accuarcy-and-fine-tuning",
+    
+    "TABAK_DB_JDBC_URL": "jdbc:mysql://YOUR_TABAK_DB_SERVER:3306/YOUR_TABAK_DATABASE",
+    "TABAK_DB_SERVER": "YOUR_TABAK_DB_SERVER",
+    "TABAK_DB_PORT": "3306",
+    "TABAK_DB_USERID": "YOUR_TABAK_DB_USER",
+    "TABAK_DB_PASSWORD": "YOUR_TABAK_DB_PASSWORD",
+    "TABAK_DB_DATABASE": "YOUR_TABAK_DATABASE",
+
+    "SERVICE_BUS_CONNECTION_STRING": "Endpoint=sb://your-service-bus-namespace.servicebus.windows.net/;SharedAccessKeyName=RootManageSharedAccessKey;SharedAccessKey=YOUR_SERVICE_BUS_KEY=",
+    "SERVICE_BUS_QUEUE_NAME": "ai-accuarcy-and-fine-tuning",
+
+    "HEALTHCARE_AI_DB_JDBC_URL": "jdbc:mysql://YOUR_HEALTHCARE_DB_SERVER:3306/YOUR_HEALTHCARE_DATABASE",
+    "HEALTHCARE_AI_DB_SERVER": "YOUR_HEALTHCARE_DB_SERVER",
+    "HEALTHCARE_AI_DB_PORT": "3306",
+    "HEALTHCARE_AI_DB_DATABASE": "YOUR_HEALTHCARE_DATABASE",
+    "HEALTHCARE_AI_DB_USERID": "YOUR_HEALTHCARE_DB_USER",
+    "HEALTHCARE_AI_DB_PASSWORD": "YOUR_HEALTHCARE_DB_PASSWORD",
+
+    "EOB_CONTAINER": "eob-dataset",
+    "SUPERBILL_CONTAINER": "superbill-dataset",
+    "TABAK_CONTAINER": "tabak-dataset",
+    "IDP_CONTAINER": "idp-dataset",
+    "CCAI_CONTAINER": "ccai-dataset",
+    "AZURE_STORAGE_CONNECTION_STRING": "DefaultEndpointsProtocol=https;AccountName=YOUR_ACCOUNT_NAME;AccountKey=YOUR_ACCOUNT_KEY;EndpointSuffix=core.windows.net",
+
+    "IDS_PER_MESSAGE": "10",
+    "MAX_MESSAGES_PER_RUN": "3",
+
+    "CCAI_STORAGE_CONNECTION_STRING": "DefaultEndpointsProtocol=https;AccountName=YOUR_CCAI_ACCOUNT_NAME;AccountKey=YOUR_CCAI_ACCOUNT_KEY;EndpointSuffix=core.windows.net",
+  
+    "MAX_ROWS": "0",
+    "RESUME_LOOKBACK_ALLOCATIONS": "0",
+    "HEALTHCARE_ACCURACY_FILE_TYPE": "eob",
+    "DISABLE_LANGFUSE_UPLOAD": "False",
+
+    "LOG_FILE_PATH": "AUX_code\\data_push.log"
+  }
+}
