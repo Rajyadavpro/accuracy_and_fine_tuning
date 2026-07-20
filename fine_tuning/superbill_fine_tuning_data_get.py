@@ -1959,22 +1959,21 @@ def superbill_fine_tuning_data_push(
     with conn:
         try:
             tables = {
-                "allocation": resolve_table_name(conn, ["AllocationRecord", "SuperBillAllocation", "SuperBillAllocations"]),
-                "claim":      resolve_table_name(conn, ["ClaimRecord", "SuperBillClaim", "SuperBillClaims"]),
-                "payer":      resolve_table_name(conn, ["PayerRecord", "SuperBillPayer", "SuperBillPayers"]),
-                "provider":   resolve_table_name(conn, ["ClaimProviderRecord", "SuperBillClaimProvider", "SuperBillClaimProviders"]),
-                "patient":    resolve_table_name(conn, ["PatientRecord", "PatientRecords"]),
-                "dx":         resolve_table_name(conn, ["DiagnosisCodesRecord", "SuperBillDiagnosisCode", "SuperBillDiagnosisCodes"]),
-                "sl":         resolve_table_name(conn, ["ServiceLineRecord", "SuperBillServiceLine", "SuperBillServiceLines"]),
+                "allocation": resolve_table_name(conn, ["SuperBillAllocations"]),
+                "claim":      resolve_table_name(conn, ["SuperBillClaims"]),
+                "payer":      resolve_table_name(conn, ["SuperBillPayers"]),
+                "provider":   resolve_table_name(conn, ["SuperBillClaimProviders"]),
+                "patient":    resolve_table_name(conn, ["PatientRecords"]),
+                "dx":         resolve_table_name(conn, ["SuperBillDiagnosisCodes"]),
+                "sl":         resolve_table_name(conn, ["SuperBillServiceLines"]),
             }
         except Exception as ex:
             logging.error(f"Table resolution error: {ex}")
             raise ex
 
-        # When unlimited, process a safe page per HTTP call; checkpoint handles continuation across runs
-        DEFAULT_BATCHES_PER_RUN = 5
-        fetch_all = False
-        max_rows = (eff_ids_per_message * eff_max_messages_per_run) if eff_max_messages_per_run is not None else (eff_ids_per_message * DEFAULT_BATCHES_PER_RUN)
+        # When unlimited (-1 → None), fetch ALL rows above checkpoint; otherwise cap at max_messages × ids_per_message
+        fetch_all = eff_max_messages_per_run is None
+        max_rows = (eff_ids_per_message * eff_max_messages_per_run) if eff_max_messages_per_run is not None else 0
 
         # Fetch using checkpoint-aware DB query
         allocations = fetch_allocations(conn, tables["allocation"], last_checkpoint_id, max_rows, fetch_all)
@@ -1982,6 +1981,45 @@ def superbill_fine_tuning_data_push(
         if not allocations:
             logging.info("No allocations found matching the current checkpoint.")
             return
+
+        # --- Batch pre-fetch: load ALL child records for the entire allocation batch in one round ---
+        # Before: N_allocations × 6 queries per allocation (N+1 problem)
+        # After:  7 queries total regardless of batch size
+        batch_alloc_ids = [a.get("Id") for a in allocations if a.get("Id") is not None]
+
+        all_claims = fetch_by_fk_many(conn, tables["claim"], "AllocationRecordId", batch_alloc_ids)
+        claims_by_alloc_id = group_rows_by_key(all_claims, "AllocationRecordId")
+        all_claim_ids = [c.get("Id") for c in all_claims if c.get("Id") is not None]
+        claim_to_alloc_id = {c.get("Id"): c.get("AllocationRecordId") for c in all_claims if c.get("Id")}
+
+        all_patient_ids = list({c.get("PatientId") for c in all_claims if c.get("PatientId") is not None})
+        batch_patient_by_id = map_rows_by_id(fetch_by_ids(conn, tables["patient"], all_patient_ids))
+
+        batch_payers_by_claim = group_rows_by_key(
+            fetch_by_fk_many(conn, tables["payer"], "ClaimRecordId", all_claim_ids), "ClaimRecordId"
+        )
+        batch_providers_by_claim = group_rows_by_key(
+            fetch_by_fk_many(conn, tables["provider"], "ClaimRecordId", all_claim_ids), "ClaimRecordId"
+        )
+        batch_dx_by_claim_id = group_rows_by_key(
+            fetch_by_fk_many(conn, tables["dx"], "ClaimRecordId", all_claim_ids), "ClaimRecordId"
+        )
+        all_service_lines = fetch_by_fk_many(conn, tables["sl"], "ClaimRecordId", all_claim_ids)
+        batch_sl_by_claim_id = group_rows_by_key(all_service_lines, "ClaimRecordId")
+
+        # Group service lines by allocation ID (for per-allocation count in audit)
+        batch_sl_by_alloc_id: Dict[Any, List[Dict]] = {}
+        for _sl in all_service_lines:
+            _cid = _sl.get("ClaimRecordId")
+            _aid = claim_to_alloc_id.get(_cid)
+            if _aid is not None:
+                batch_sl_by_alloc_id.setdefault(_aid, []).append(_sl)
+
+        logging.info(
+            "[Superbill] Pre-fetch complete: %d allocations, %d claims, %d service lines",
+            len(batch_alloc_ids), len(all_claims), len(all_service_lines),
+        )
+        # ---------------------------------------------------------------------------------
 
         written = 0
         skipped = 0
@@ -2041,27 +2079,16 @@ def superbill_fine_tuning_data_push(
                 if isinstance(ci, dict) and isinstance(ci.get("Claim"), dict):
                     original_claims.append(ci["Claim"])
 
-            db_claims = fetch_by_fk(conn, tables["claim"], "AllocationRecordId", alloc_id)
+            # Use pre-fetched data — no per-allocation DB queries
+            db_claims = claims_by_alloc_id.get(alloc_id, [])
             claim_ids = [c.get("Id") for c in db_claims if c.get("Id") is not None]
 
-            patient_ids = {c.get("PatientId") for c in db_claims if c.get("PatientId") is not None}
-            patient_by_id = map_rows_by_id(fetch_by_ids(conn, tables["patient"], list(patient_ids)))
-
-            # Fetch payees, payers, providers by foreign keys
-            payers_by_claim = group_rows_by_key(
-                fetch_by_fk_many(conn, tables["payer"], "ClaimRecordId", claim_ids),
-                "ClaimRecordId",
-            )
-            providers_by_claim = group_rows_by_key(
-                fetch_by_fk_many(conn, tables["provider"], "ClaimRecordId", claim_ids),
-                "ClaimRecordId",
-            )
-            dx_by_claim_id = group_rows_by_key(
-                fetch_by_fk_many(conn, tables["dx"], "ClaimRecordId", claim_ids),
-                "ClaimRecordId",
-            )
-            service_lines = fetch_by_fk_many(conn, tables["sl"], "ClaimRecordId", claim_ids)
-            service_lines_by_claim_id = group_rows_by_key(service_lines, "ClaimRecordId")
+            patient_by_id = batch_patient_by_id
+            payers_by_claim = batch_payers_by_claim
+            providers_by_claim = batch_providers_by_claim
+            dx_by_claim_id = batch_dx_by_claim_id
+            service_lines = batch_sl_by_alloc_id.get(alloc_id, [])
+            service_lines_by_claim_id = batch_sl_by_claim_id
 
             gt_claims_info = []
             for idx, db_claim in enumerate(db_claims):

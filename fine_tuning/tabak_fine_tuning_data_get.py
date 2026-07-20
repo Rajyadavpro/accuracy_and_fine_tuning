@@ -68,9 +68,9 @@ def _get_oldest_date_from_db(server: str, port: str, database: str, user: str, p
         connection = _get_db_connection(server, port, database, user, password)
         cursor = connection.cursor()
         
-        # Query for oldest CreatedDate where template_info is valid
+        # Query for oldest date_created where template_info is valid
         query = (
-            "SELECT MIN(DATE(CreatedDate)) as oldest_date FROM va_Rating_Decisions "
+            "SELECT MIN(DATE(date_created)) as oldest_date FROM `Transactions` "
             "WHERE template_info IS NOT NULL AND template_info != '' AND JSON_VALID(template_info) "
             "LIMIT 1"
         )

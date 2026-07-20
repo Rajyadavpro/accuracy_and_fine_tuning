@@ -2018,23 +2018,22 @@ def eob_fine_tuning_data_push(
     with conn:
         try:
             tables = {
-                "allocation":         resolve_table_name(conn, ["EOB_Allocation", "EOBAllocations"]),
-                "claim":               resolve_table_name(conn, ["EOB_Claim", "EOBClaims"]),
-                "payer":               resolve_table_name(conn, ["EOB_Payer", "EOBPayers"]),
-                "payee":               resolve_table_name(conn, ["EOB_Payee", "EOBPayees"]),
-                "diagnosis":           resolve_table_name(conn, ["EOB_Claim_Diagnosis", "EOBClaim_Diagnosis"]),
-                "service_line":        resolve_table_name(conn, ["EOB_Service_Line_Item", "EOBService_Line_Items"]),
-                "service_adjustment":  resolve_table_name(conn, ["EOB_Service_Adjustment", "EOBService_Adjustments"]),
-                "patient":             resolve_table_name(conn, ["PatientRecord", "PatientRecords"]),
+                "allocation":         resolve_table_name(conn, ["EOBAllocations"]),
+                "claim":               resolve_table_name(conn, ["EOBClaims"]),
+                "payer":               resolve_table_name(conn, ["EOBPayers"]),
+                "payee":               resolve_table_name(conn, ["EOBPayees"]),
+                "diagnosis":           resolve_table_name(conn, ["EOBClaim_Diagnosis"]),
+                "service_line":        resolve_table_name(conn, ["EOBService_Line_Items"]),
+                "service_adjustment":  resolve_table_name(conn, ["EOBService_Adjustments"]),
+                "patient":             resolve_table_name(conn, ["PatientRecords"]),
             }
         except Exception as ex:
             logging.error(f"Table resolution error: {ex}")
             raise ex
 
-        # When unlimited (-1), process a safe page per HTTP call; checkpoint handles continuation across runs
-        DEFAULT_BATCHES_PER_RUN = 5  # 5 batches × ids_per_message records per run when unlimited
-        fetch_all = False
-        max_rows = (eff_ids_per_message * eff_max_messages_per_run) if eff_max_messages_per_run is not None else (eff_ids_per_message * DEFAULT_BATCHES_PER_RUN)
+        # When unlimited (-1 → None), fetch ALL rows above checkpoint; otherwise cap at max_messages × ids_per_message
+        fetch_all = eff_max_messages_per_run is None
+        max_rows = (eff_ids_per_message * eff_max_messages_per_run) if eff_max_messages_per_run is not None else 0
 
         # Fetch using checkpoint and date aware DB query
         allocations = fetch_allocations(
@@ -2050,6 +2049,48 @@ def eob_fine_tuning_data_push(
         if not allocations:
             logging.info("No allocations found matching the current filters or checkpoint.")
             return
+
+        # --- Batch pre-fetch: load ALL child records for the entire allocation batch in one round ---
+        # Before: N_allocations × 7 queries per allocation (N+1 problem)
+        # After:  8 queries total regardless of batch size
+        batch_alloc_ids = [a.get("Id") for a in allocations if a.get("Id") is not None]
+
+        all_claims = fetch_by_fk_many(conn, tables["claim"], "AllocationId", batch_alloc_ids)
+        claims_by_alloc_id = group_rows_by_key(all_claims, "AllocationId")
+        all_claim_ids = [c.get("Id") for c in all_claims if c.get("Id") is not None]
+        claim_to_alloc_id = {c.get("Id"): c.get("AllocationId") for c in all_claims if c.get("Id")}
+
+        all_payer_ids = list({c.get("PayerId") for c in all_claims if c.get("PayerId") is not None})
+        all_payee_ids = list({c.get("PayeeId") for c in all_claims if c.get("PayeeId") is not None})
+        all_patient_ids = list({c.get("PatientId") for c in all_claims if c.get("PatientId") is not None})
+        batch_payer_by_id = map_rows_by_id(fetch_by_ids(conn, tables["payer"], all_payer_ids))
+        batch_payee_by_id = map_rows_by_id(fetch_by_ids(conn, tables["payee"], all_payee_ids))
+        batch_patient_by_id = map_rows_by_id(fetch_by_ids(conn, tables["patient"], all_patient_ids))
+
+        batch_dx_by_claim_id = group_rows_by_key(
+            fetch_by_fk_many(conn, tables["diagnosis"], "ClaimId", all_claim_ids), "ClaimId"
+        )
+        all_service_lines = fetch_by_fk_many(conn, tables["service_line"], "ClaimId", all_claim_ids)
+        batch_sl_by_claim_id = group_rows_by_key(all_service_lines, "ClaimId")
+        all_sl_ids = [sl.get("Id") for sl in all_service_lines if sl.get("Id") is not None]
+        batch_adj_by_sl_id = group_rows_by_key(
+            fetch_by_fk_many(conn, tables["service_adjustment"], "ServiceLineItemId", all_sl_ids),
+            "ServiceLineItemId",
+        )
+
+        # Group service lines by allocation ID for per-allocation count in audit
+        batch_sl_by_alloc_id: Dict[Any, List[Dict]] = {}
+        for _sl in all_service_lines:
+            _cid = _sl.get("ClaimId")
+            _aid = claim_to_alloc_id.get(_cid)
+            if _aid is not None:
+                batch_sl_by_alloc_id.setdefault(_aid, []).append(_sl)
+
+        logging.info(
+            "[EOB] Pre-fetch complete: %d allocations, %d claims, %d service lines",
+            len(batch_alloc_ids), len(all_claims), len(all_service_lines),
+        )
+        # ---------------------------------------------------------------------------------
 
         written = 0
         skipped = 0
@@ -2106,28 +2147,17 @@ def eob_fine_tuning_data_push(
                 if isinstance(ci, dict) and isinstance(ci.get("Claim"), dict):
                     original_claims.append(ci["Claim"])
 
-            db_claims = fetch_by_fk(conn, tables["claim"], "AllocationId", alloc_id)
+            # Use pre-fetched data — no per-allocation DB queries
+            db_claims = claims_by_alloc_id.get(alloc_id, [])
             claim_ids = [c.get("Id") for c in db_claims if c.get("Id") is not None]
 
-            payer_ids = {c.get("PayerId") for c in db_claims if c.get("PayerId") is not None}
-            payee_ids = {c.get("PayeeId") for c in db_claims if c.get("PayeeId") is not None}
-            patient_ids = {c.get("PatientId") for c in db_claims if c.get("PatientId") is not None}
-
-            payer_by_id = map_rows_by_id(fetch_by_ids(conn, tables["payer"], list(payer_ids)))
-            payee_by_id = map_rows_by_id(fetch_by_ids(conn, tables["payee"], list(payee_ids)))
-            patient_by_id = map_rows_by_id(fetch_by_ids(conn, tables["patient"], list(patient_ids)))
-
-            dx_by_claim_id = group_rows_by_key(
-                fetch_by_fk_many(conn, tables["diagnosis"], "ClaimId", claim_ids),
-                "ClaimId",
-            )
-            service_lines = fetch_by_fk_many(conn, tables["service_line"], "ClaimId", claim_ids)
-            service_lines_by_claim_id = group_rows_by_key(service_lines, "ClaimId")
-            service_line_ids = [sl.get("Id") for sl in service_lines if sl.get("Id") is not None]
-            adjustments_by_service_line_id = group_rows_by_key(
-                fetch_by_fk_many(conn, tables["service_adjustment"], "ServiceLineItemId", service_line_ids),
-                "ServiceLineItemId",
-            )
+            payer_by_id = batch_payer_by_id
+            payee_by_id = batch_payee_by_id
+            patient_by_id = batch_patient_by_id
+            dx_by_claim_id = batch_dx_by_claim_id
+            service_lines = batch_sl_by_alloc_id.get(alloc_id, [])
+            service_lines_by_claim_id = batch_sl_by_claim_id
+            adjustments_by_service_line_id = batch_adj_by_sl_id
 
             gt_claims_info = []
             for idx, db_claim in enumerate(db_claims):
