@@ -1054,10 +1054,10 @@ if not logging.getLogger().handlers:
 
 
 def _load_checkpoint_from_langfuse(checkpoint_dataset_name: str) -> Optional[int]:
-    """Retrieve last processed allocation_id from ClickHouse."""
+    """Retrieve last processed allocation_id from ClickHouse using folder-specific table."""
     logging.info(f"[ClickHouse] Loading checkpoint from table '{checkpoint_dataset_name}'...")
     try:
-        last_id = load_checkpoint_int(SUPERBILL_FINETUNING_CHECKPOINT_TABLE, get_environment())
+        last_id = load_checkpoint_int(checkpoint_dataset_name, get_environment())
         if last_id is None:
             logging.info("[ClickHouse] Checkpoint table empty. Clean start.")
             return None
@@ -1069,13 +1069,52 @@ def _load_checkpoint_from_langfuse(checkpoint_dataset_name: str) -> Optional[int
 
 
 def _save_checkpoint_to_langfuse(checkpoint_dataset_name: str, last_allocation_id: int) -> None:
-    """Save last processed allocation_id to ClickHouse."""
+    """Save last processed allocation_id to ClickHouse using folder-specific table."""
     logging.info(f"[ClickHouse] Saving checkpoint: last_allocation_id='{last_allocation_id}'...")
     try:
-        save_checkpoint_int(SUPERBILL_FINETUNING_CHECKPOINT_TABLE, get_environment(), last_allocation_id)
+        save_checkpoint_int(checkpoint_dataset_name, get_environment(), last_allocation_id)
         logging.info(f"[ClickHouse] SUCCESS: Checkpoint saved with last_allocation_id='{last_allocation_id}'")
     except Exception as ex:
         logging.error(f"[ClickHouse] Checkpoint save failed: {ex}")
+
+
+def _get_oldest_date_from_db(db_config: 'DbConfig') -> Optional[str]:
+    """Retrieve the oldest date from Superbill database for records with RawJson."""
+    logging.info("[Database] Fetching oldest date from database...")
+    try:
+        conn = pymysql.connect(
+            host=db_config.host,
+            port=db_config.port,
+            user=db_config.user,
+            password=db_config.password,
+            database=db_config.database,
+            connect_timeout=30,
+            charset="utf8mb4"
+        )
+        cursor = conn.cursor(DictCursor)
+        
+        # Query for oldest CreatedDate where RawJson exists
+        query = (
+            "SELECT MIN(DATE(CreatedDate)) as oldest_date FROM Allocations "
+            "WHERE RawJson IS NOT NULL AND RawJson != '' "
+            "LIMIT 1"
+        )
+        cursor.execute(query)
+        result = cursor.fetchone()
+        cursor.close()
+        conn.close()
+        
+        if result and result.get('oldest_date'):
+            oldest_date_str = f"{result['oldest_date']} 00:00:00"
+            logging.info(f"[Database] SUCCESS: Oldest date found: {oldest_date_str}")
+            return oldest_date_str
+        else:
+            logging.warning("[Database] No records found with RawJson")
+            return None
+    except Exception as e:
+        logging.error(f"[Database] Failed to fetch oldest date: {e}", exc_info=True)
+        return None
+
 
 # ---------------------------------------------------------------------------
 # Config helpers (adapted from EOB with default fallbacks)
@@ -1725,6 +1764,7 @@ def _send_superbill_records_to_queue(
     records: List[Dict[str, Any]],
     ids_per_message: int,
     max_messages_per_run: Optional[int],
+    folder_name: str = "main",
     progress_log_batch_size: int = 10,
 ) -> int:
     """Send Superbill fine-tuning records to Service Bus queue in chunked messages."""
@@ -1750,7 +1790,8 @@ def _send_superbill_records_to_queue(
             records[i:i + ids_per_message]
             for i in range(0, len(records), ids_per_message)
         ]
-        if max_messages_per_run is not None and max_messages_per_run > 0:
+        # Treat -1 as unlimited
+        if max_messages_per_run is not None and max_messages_per_run != -1 and max_messages_per_run > 0:
             chunks = chunks[:max_messages_per_run]
         
         with client.get_queue_sender(queue_name, socket_timeout=10.0) as sender:
@@ -1773,12 +1814,14 @@ def _send_superbill_records_to_queue(
                         "allocation_ids": allocation_ids,
                         "records": chunk_payload,
                         "source": "healthcare_superbill",
+                        "container": os.getenv("SUPERBILL_CONTAINER", "superbill-dataset"),
+                        "folder_name": folder_name,
                         "environment": os.getenv("LANGFUSE_ENVIRONMENT", "exp"),
                         "process_type": "FineTuning",
                         "queued_at": dt.datetime.now(dt.timezone.utc).isoformat(),
                     }
                     msg = ServiceBusMessage(json.dumps(body, cls=_Encoder))
-                    sender.send_messages(msg)
+                    sender.send_messages([msg])
                     messages_sent += 1
                     records_dispatched += len(chunk)
                     
@@ -1796,11 +1839,23 @@ def _send_superbill_records_to_queue(
 
 def superbill_fine_tuning_data_push(
     ids_per_message: Optional[int] = None,
-    max_messages_per_run: Optional[int] = None
+    max_messages_per_run: Optional[int] = None,
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    folder_name: Optional[str] = None,
+    bypass_checkpoint: bool = False
 ) -> None:
     """
     Generate Superbill fine-tuning data.
     Callable by Azure Functions triggers as well as manual standalone executions.
+    
+    Args:
+        ids_per_message: IDs per message (optional, uses env if not provided)
+        max_messages_per_run: Max messages per run (optional, uses env if not provided)
+        start_date: Start date in format 'YYYY-MM-DD HH:MM:SS' (optional)
+        end_date: End date in format 'YYYY-MM-DD HH:MM:SS' (optional)
+        folder_name: Logical folder/group name for checkpoint isolation and output (default: 'main')
+        bypass_checkpoint: If True, ignore checkpoint and use start_date/end_date; if False, compare checkpoint with start_date
     """
     script_dir = os.path.dirname(os.path.abspath(__file__))
     load_dotenv_file(os.path.join(script_dir, ".env"))
@@ -1820,7 +1875,7 @@ def superbill_fine_tuning_data_push(
 
     env_max_messages = (os.getenv("MAX_MESSAGES_PER_RUN") or "").strip()
     eff_max_messages_per_run = (
-        max_messages_per_run
+        (None if max_messages_per_run == -1 else max_messages_per_run)  # Treat -1 as unlimited
         if max_messages_per_run is not None
         else int(env_max_messages) if env_max_messages else None
     )
@@ -1832,14 +1887,45 @@ def superbill_fine_tuning_data_push(
         eff_ids_per_message,
         eff_max_messages_per_run,
     )
+    
+    # folder_name isolates checkpoint and output data — defaults to 'main'
+    folder_name = (folder_name or "main").strip()
+    logging.info(f"[Config] Using folder_name: {folder_name}")
+    
+    # Handle dates and checkpoint logic
+    logging.info(f"[Config] start_date={start_date}, end_date={end_date}, bypass_checkpoint={bypass_checkpoint}")
+    
+    effective_start_date = start_date
+    effective_end_date = end_date or dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    
+    # Get database config first for oldest date lookup
+    try:
+        cfg = resolve_db_config()
+    except Exception as ex:
+        logging.error(f"Config error: {ex}")
+        raise ex
+    
+    # If start_date not provided, fetch oldest date from database
+    if not effective_start_date:
+        logging.info("[Config] start_date not provided, fetching oldest date from database...")
+        effective_start_date = _get_oldest_date_from_db(cfg)
+        if effective_start_date:
+            logging.info(f"[Config] Using oldest date from database: {effective_start_date}")
+        else:
+            logging.warning("[Config] Could not determine oldest date, using current date")
+            effective_start_date = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
     # -----------------------------------------------------
     # Langfuse Checkpoint Init
     # -----------------------------------------------------
     langfuse_environment = os.getenv("LANGFUSE_ENVIRONMENT", "exp").strip()
-    checkpoint_dataset_name = f"superbill_finetuning_checkpoint_{langfuse_environment}"
+    checkpoint_dataset_name = f"superbill_finetuning_checkpoint_{folder_name}"
+    logging.info(f"[Config] Using checkpoint table: {checkpoint_dataset_name}")
     
-    last_checkpoint_id = _load_checkpoint_from_langfuse(checkpoint_dataset_name)
+    last_checkpoint_id = None if bypass_checkpoint else _load_checkpoint_from_langfuse(checkpoint_dataset_name)
+    
+    if bypass_checkpoint:
+        logging.info("[Fine Tuning Task] Checkpoint bypass is enabled, using provided start_date/end_date")
 
     outdir = outdir_name if os.path.isabs(outdir_name) else os.path.join(script_dir, outdir_name)
     pdf_output_dir = os.path.join(outdir, pdf_subdir)
@@ -1858,12 +1944,6 @@ def superbill_fine_tuning_data_push(
         except Exception as ex:
             logging.error(f"Config error: could not initialize Azure Blob client: {ex}")
             raise ex
-
-    try:
-        cfg = resolve_db_config()
-    except Exception as ex:
-        logging.error(f"Config error: {ex}")
-        raise ex
 
     try:
         conn = pymysql.connect(
@@ -1891,8 +1971,10 @@ def superbill_fine_tuning_data_push(
             logging.error(f"Table resolution error: {ex}")
             raise ex
 
-        fetch_all = eff_max_messages_per_run is None
-        max_rows = (eff_ids_per_message * eff_max_messages_per_run) if eff_max_messages_per_run is not None else 10
+        # When unlimited, process a safe page per HTTP call; checkpoint handles continuation across runs
+        DEFAULT_BATCHES_PER_RUN = 5
+        fetch_all = False
+        max_rows = (eff_ids_per_message * eff_max_messages_per_run) if eff_max_messages_per_run is not None else (eff_ids_per_message * DEFAULT_BATCHES_PER_RUN)
 
         # Fetch using checkpoint-aware DB query
         allocations = fetch_allocations(conn, tables["allocation"], last_checkpoint_id, max_rows, fetch_all)
@@ -1908,6 +1990,8 @@ def superbill_fine_tuning_data_push(
         skipped_pdfs = 0
         failed_pdfs = 0
         outputs: List[Dict[str, Any]] = []
+        total_queued = 0
+        batch_count = 0
 
         # Process in ASCENDING order of allocation ID
         for alloc_row in sorted(allocations, key=lambda r: r.get("Id") or 0, reverse=False):
@@ -2030,24 +2114,47 @@ def superbill_fine_tuning_data_push(
             written += 1
             logging.info(f"  OK AllocationId={alloc_id}")
 
-        # Keep output elements sorted ascending by allocation_id
-        outputs.sort(key=lambda item: item.get("allocation_id") or 0, reverse=False)
-        
-        # -----------------------------------------------------
-        # Dispatch & Save Final Checkpoint
-        # -----------------------------------------------------
-        if outputs:
-            queue_count = _send_superbill_records_to_queue(
+            # Send to queue immediately when a full batch is ready
+            if len(outputs) >= eff_ids_per_message:
+                batch_count += 1
+                logging.info(f"[Superbill] Sending batch {batch_count} ({len(outputs)} records)...")
+                try:
+                    sent = _send_superbill_records_to_queue(
+                        outputs,
+                        ids_per_message=eff_ids_per_message,
+                        max_messages_per_run=None,
+                        folder_name=folder_name,
+                    )
+                    total_queued += sent
+                    last_id = outputs[-1].get("allocation_id")
+                    if last_id:
+                        _save_checkpoint_to_langfuse(checkpoint_dataset_name, last_id)
+                        logging.info(f"[Superbill] Batch {batch_count} sent. Checkpoint saved: {last_id}")
+                except Exception as e:
+                    logging.error(f"[Superbill] Error sending batch {batch_count}: {e}", exc_info=True)
+                finally:
+                    outputs.clear()
+
+    # --- Send any remaining records (partial final batch) ---
+    if outputs:
+        batch_count += 1
+        logging.info(f"[Superbill] Sending final batch {batch_count} ({len(outputs)} records)...")
+        try:
+            sent = _send_superbill_records_to_queue(
                 outputs,
                 ids_per_message=eff_ids_per_message,
-                max_messages_per_run=eff_max_messages_per_run,
+                max_messages_per_run=None,
+                folder_name=folder_name,
             )
-            last_dispatched_id = outputs[-1].get("allocation_id")
-            
-            if last_dispatched_id:
-                _save_checkpoint_to_langfuse(checkpoint_dataset_name, last_dispatched_id)
-        else:
-            queue_count = 0
+            total_queued += sent
+            last_id = outputs[-1].get("allocation_id")
+            if last_id:
+                _save_checkpoint_to_langfuse(checkpoint_dataset_name, last_id)
+                logging.info(f"[Superbill] Final batch {batch_count} sent. Checkpoint saved: {last_id}")
+        except Exception as e:
+            logging.error(f"[Superbill] Error sending final batch {batch_count}: {e}", exc_info=True)
+
+    queue_count = total_queued
 
     logging.info(f"Done. Written: {written}, Skipped: {skipped}")
     if download_enabled:

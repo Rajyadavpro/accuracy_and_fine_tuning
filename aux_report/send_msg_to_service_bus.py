@@ -23,10 +23,22 @@ def send_demo_message():
         print(f"[*] Connecting to Service Bus queue: '{queue_name}'...")
         with ServiceBusClient.from_connection_string(conn_str) as client:
             with client.get_queue_sender(queue_name) as sender:
-                # You can customize this demo payload
+                
+                # --- UPDATED PAYLOAD HERE ---
                 demo_payload = {
-                    "message": "Hello from demo script",
-                    "status": "Test"
+                    "record_ids": ["16395", "16487"], 
+                    "File name": [
+                        "July_10th__2026_1---RD----556Pgs----Anshika--_19_docs__20260710053559350879_0.pdf", 
+                        "July_10th__2026_1---RD----556Pgs----Anshika--_19_docs__20260710053611701857_0_veteran.pdf"
+                    ], 
+                    "Ground_truth": [
+                        {"category": "VA_Rating_Decision", "subcategory": "", "is_correct": True}, 
+                        {"category": "VA_Rating_Decision", "subcategory": "", "is_correct": True}
+                    ], 
+                    "source": "tabak", 
+                    "environment": "Dev", 
+                    "process_type": "FineTuning", 
+                    "queued_at": "2026-07-20T11:19:23.300398+00:00"
                 }
                 
                 message = ServiceBusMessage(json.dumps(demo_payload))

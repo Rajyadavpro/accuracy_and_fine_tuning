@@ -140,6 +140,6 @@ if __name__ == "__main__":
     # --- DELETION TOGGLE ---
     # True  -> Messages are downloaded AND deleted from the Azure Queue.
     # False -> Messages are downloaded, but remain in the Queue (Read-Only / Peek mode).
-    DELETE_FROM_QUEUE = False 
+    DELETE_FROM_QUEUE = False
     
     fetch_and_save_messages(limit=N, delete_from_queue=DELETE_FROM_QUEUE, output_dir=r"C:\Users\raj.kumaryadav\Desktop\Superbill\Main_Git_repo\Accuracy_and_Fine_tuning_f1\fetched_messages")

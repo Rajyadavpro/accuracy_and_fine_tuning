@@ -545,10 +545,10 @@ def _extract_filename(path_value: str) -> str:
 
 
 def _load_checkpoint_from_langfuse(checkpoint_dataset_name: str) -> Optional[int]:
-    """Retrieve last processed ID from ClickHouse."""
+    """Retrieve last processed ID from ClickHouse using folder-specific table."""
     logging.info(f"[ClickHouse] Loading checkpoint from table '{checkpoint_dataset_name}'...")
     try:
-        last_id = load_checkpoint_int(IDP_FINETUNING_CHECKPOINT_TABLE, get_environment())
+        last_id = load_checkpoint_int(checkpoint_dataset_name, get_environment())
         if last_id is None:
             logging.info("[ClickHouse] Checkpoint table empty. Clean start.")
             return None
@@ -561,14 +561,45 @@ def _load_checkpoint_from_langfuse(checkpoint_dataset_name: str) -> Optional[int
 
 
 def _save_checkpoint_to_langfuse(checkpoint_dataset_name: str, langfuse_environment: str, last_id: int) -> None:
-    """Save last processed ID to ClickHouse."""
+    """Save last processed ID to ClickHouse using folder-specific table."""
     logging.info(f"[ClickHouse] Saving checkpoint: last_id='{last_id}'...")
     try:
-        save_checkpoint_int(IDP_FINETUNING_CHECKPOINT_TABLE, get_environment(), last_id)
+        save_checkpoint_int(checkpoint_dataset_name, get_environment(), last_id)
         logging.info(f"[ClickHouse] SUCCESS: Checkpoint saved with last_id='{last_id}'")
     except Exception as ex:
         logging.error(f"[ClickHouse] FAILURE: {ex}", exc_info=True)
         raise ex
+
+
+def _get_oldest_date_from_db(server: str, database: str, user: str, password: str) -> Optional[str]:
+    """Retrieve the oldest date from IDP database for records with ResponsePayload."""
+    logging.info("[Database] Fetching oldest date from database...")
+    try:
+        conn = _get_db_connection(server, database, user, password)
+        cursor = conn.cursor()
+        
+        # Query for oldest CreatedDate where ResponsePayload exists
+        query = (
+            "SELECT CAST(MIN(CAST(CreatedDate AS DATE)) AS VARCHAR(10)) as oldest_date "
+            "FROM dbo.vw_PdfClassificationTransactionLog "
+            "WHERE ResponsePayload IS NOT NULL "
+        )
+        cursor.execute(query)
+        result = cursor.fetchone()
+        cursor.close()
+        conn.close()
+        
+        if result and result[0]:
+            oldest_date_str = f"{result[0]} 00:00:00"
+            logging.info(f"[Database] SUCCESS: Oldest date found: {oldest_date_str}")
+            return oldest_date_str
+        else:
+            logging.warning("[Database] No records found with ResponsePayload")
+            return None
+    except Exception as e:
+        logging.error(f"[Database] Failed to fetch oldest date: {e}", exc_info=True)
+        return None
+
 
 # ==========================================
 # DATABASE UTILITIES (ALIGNED TO SQL SERVER)
@@ -626,7 +657,7 @@ def _send_to_azure_queue(queue_name: str, messages: List[str]) -> None:
         with ServiceBusClient.from_connection_string(connection_string) as client:
             with client.get_queue_sender(queue_name=queue_name) as sender:
                 for idx, msg in enumerate(messages, 1):
-                    sender.send_messages(ServiceBusMessage(msg))
+                    sender.send_messages([ServiceBusMessage(msg)])
                     logging.info(f"[Queue] Message {idx}/{len(messages)} sent.")
     except Exception as e:
         logging.error(f"[Queue] FAILURE: {e}", exc_info=True)
@@ -640,9 +671,22 @@ def _send_to_azure_queue(queue_name: str, messages: List[str]) -> None:
 
 def idp_fine_tuning_data_push(
     ids_per_message: Optional[int] = None, 
-    max_messages_per_run: Optional[int] = None
+    max_messages_per_run: Optional[int] = None,
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    folder_name: Optional[str] = None,
+    bypass_checkpoint: bool = False
 ) -> None:
-    """Fetch metadata from IDP database view and dispatch FineTuning message to Service Bus."""
+    """Fetch metadata from IDP database view and dispatch FineTuning message to Service Bus.
+    
+    Args:
+        ids_per_message: IDs per message (optional, uses env if not provided)
+        max_messages_per_run: Max messages per run (optional, uses env if not provided)
+        start_date: Start date in format 'YYYY-MM-DD HH:MM:SS' (optional)
+        end_date: End date in format 'YYYY-MM-DD HH:MM:SS' (optional)
+        folder_name: Logical folder/group name for checkpoint isolation and output (default: 'main')
+        bypass_checkpoint: If True, ignore checkpoint and use start_date/end_date; if False, compare checkpoint with start_date
+    """
     
     logging.info("=============================================================")
     logging.info("[Fine Tuning Task] Starting IDP Fine Tuning Data Push...")
@@ -654,7 +698,6 @@ def idp_fine_tuning_data_push(
     logging.info("[Config] Validating environment...")
     
     langfuse_environment = os.getenv("LANGFUSE_ENVIRONMENT", "exp").strip()
-    checkpoint_dataset_name = f"idp_finetuning_checkpoint_{langfuse_environment}"
     
     queue_name = os.getenv("SERVICE_BUS_QUEUE_NAME", "").strip()
     if not queue_name:
@@ -665,10 +708,36 @@ def idp_fine_tuning_data_push(
     
     max_messages_per_run_str = os.getenv("MAX_MESSAGES_PER_RUN", "").strip()
     eff_max_messages_per_run = (
-        max_messages_per_run 
+        (None if max_messages_per_run == -1 else max_messages_per_run)  # Treat -1 as unlimited
         if max_messages_per_run is not None 
         else (int(max_messages_per_run_str) if max_messages_per_run_str else None)
     )
+    
+    # folder_name isolates checkpoint and output data — defaults to 'main'
+    folder_name = (folder_name or "main").strip()
+    logging.info(f"[Config] Using folder_name: {folder_name}")
+    
+    # Handle dates and checkpoint logic
+    logging.info(f"[Config] start_date={start_date}, end_date={end_date}, bypass_checkpoint={bypass_checkpoint}")
+    
+    effective_start_date = start_date
+    effective_end_date = end_date or datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    
+    # Get database credentials for oldest date lookup
+    server = os.getenv("IDP_SQL_SERVER")
+    database = os.getenv("IDP_SQL_DATABASE")
+    user = os.getenv("IDP_SQL_USER")
+    password = os.getenv("IDP_SQL_PASSWORD", "")
+    
+    # If start_date not provided, fetch oldest date from database
+    if not effective_start_date:
+        logging.info("[Config] start_date not provided, fetching oldest date from database...")
+        effective_start_date = _get_oldest_date_from_db(server, database, user, password)
+        if effective_start_date:
+            logging.info(f"[Config] Using oldest date from database: {effective_start_date}")
+        else:
+            logging.warning("[Config] Could not determine oldest date, using current date")
+            effective_start_date = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     
     logging.info(f"[Config] Environment valid. IDs/msg={eff_ids_per_message}, MaxMsgs={eff_max_messages_per_run}")
     
@@ -676,7 +745,12 @@ def idp_fine_tuning_data_push(
     # STEP 1: Load checkpoint
     # ==========================================
     logging.info("[Fine Tuning Task] Step 1: Loading checkpoint...")
-    last_checkpoint_id = _load_checkpoint_from_langfuse(checkpoint_dataset_name)
+    checkpoint_dataset_name = f"idp_finetuning_checkpoint_{folder_name}"
+    logging.info(f"[Config] Using checkpoint table: {checkpoint_dataset_name}")
+    last_checkpoint_id = None if bypass_checkpoint else _load_checkpoint_from_langfuse(checkpoint_dataset_name)
+    
+    if bypass_checkpoint:
+        logging.info("[Fine Tuning Task] Checkpoint bypass is enabled, using provided start_date/end_date")
     
     # ==========================================
     # STEP 2: Build query (Using SQL Server syntax and view)
@@ -706,10 +780,6 @@ def idp_fine_tuning_data_push(
     # STEP 3: Fetch from database
     # ==========================================
     logging.info("[Fine Tuning Task] Step 3: Executing database query...")
-    server = os.getenv("IDP_SQL_SERVER")
-    database = os.getenv("IDP_SQL_DATABASE")
-    user = os.getenv("IDP_SQL_USER")
-    password = os.getenv("IDP_SQL_PASSWORD", "")
     
     try:
         with _get_db_connection(server, database, user, password) as conn:
@@ -827,52 +897,66 @@ def idp_fine_tuning_data_push(
     # STEP 6: Format messages with Service Bus schema
     # ==========================================
     logging.info("[Fine Tuning Task] Step 6: Formatting messages...")
-    formatted_messages = []
-    for chunk in chunks:
-        # Extract corresponding lists representing the current chunk of records
-        allocation_ids = [r["allocation_id"] for r in chunk]
-        file_names = [r["file_name"] for r in chunk]
-        client_codes = [r["client_code"] for r in chunk]
-        predictions = [r["prediction"] for r in chunk]
+    # ==========================================
+    # STEP 6 & 7: Format and send messages in batches
+    # ==========================================
+    logging.info("[Fine Tuning Task] Step 6-7: Formatting and dispatching messages in batches...")
+    
+    total_sent = 0
+    batch_dispatch_size = 10  # Send 10 messages at a time
+    last_dispatched_id = None
+    
+    for batch_start in range(0, len(chunks), batch_dispatch_size):
+        batch_end = min(batch_start + batch_dispatch_size, len(chunks))
+        batch_chunks = chunks[batch_start:batch_end]
+        batch_num = (batch_start // batch_dispatch_size) + 1
+        total_batches = (len(chunks) + batch_dispatch_size - 1) // batch_dispatch_size
         
-        payload = {
-            "file_names": file_names,
-            "allocation_ids": allocation_ids,
-            "client_code": client_codes,
-            "ground_truth": predictions,
-            "records": chunk,
-            "source": "idp",
-            "environment": langfuse_environment,
-            "process_type": "FineTuning",
-            "queued_at": datetime.now(timezone.utc).isoformat()
-        }
-        formatted_messages.append(json.dumps(payload))
+        logging.info(f"[Fine Tuning Task] Sending batch {batch_num}/{total_batches} ({len(batch_chunks)} messages)...")
+        
+        formatted_messages = []
+        for chunk in batch_chunks:
+            # Extract corresponding lists representing the current chunk of records
+            allocation_ids = [r["allocation_id"] for r in chunk]
+            file_names = [r["file_name"] for r in chunk]
+            client_codes = [r["client_code"] for r in chunk]
+            predictions = [r["prediction"] for r in chunk]
+            
+            payload = {
+                "file_names": file_names,
+                "allocation_ids": allocation_ids,
+                "client_code": client_codes,
+                "ground_truth": predictions,
+                "records": chunk,
+                "source": "idp",
+                "container": os.getenv("IDP_CONTAINER", "idp-dataset"),
+                "folder_name": folder_name,
+                "environment": langfuse_environment,
+                "process_type": "FineTuning",
+                "queued_at": datetime.now(timezone.utc).isoformat()
+            }
+            formatted_messages.append(json.dumps(payload))
+        
+        last_dispatched_id = batch_chunks[-1][-1]["allocation_id"]
+        
+        try:
+            _send_to_azure_queue(queue_name, formatted_messages)
+            total_sent += len(formatted_messages)
+            logging.info(f"[Fine Tuning Task] Batch {batch_num} sent. Last ID: '{last_dispatched_id}'")
+            
+            # Save checkpoint after each batch
+            try:
+                _save_checkpoint_to_langfuse(checkpoint_dataset_name, langfuse_environment, last_dispatched_id)
+                logging.info(f"[Fine Tuning Task] Checkpoint saved after batch {batch_num}")
+            except Exception as cp_ex:
+                logging.warning(f"[Fine Tuning Task] Failed to save checkpoint: {cp_ex}")
+                
+        except Exception as e:
+            logging.error(f"[Fine Tuning Task] FAILURE sending batch {batch_num}: {e}", exc_info=True)
+            # Continue with next batch even if this one fails
+            continue
     
-    last_dispatched_id = chunks[-1][-1]["allocation_id"]
-    logging.info(f"[Fine Tuning Task] Last ID: '{last_dispatched_id}'")
-    
-    # ==========================================
-    # STEP 7: Dispatch to queue
-    # ==========================================
-    logging.info(f"[Fine Tuning Task] Step 7: Dispatching {len(formatted_messages)} message(s)...")
-    try:
-        _send_to_azure_queue(queue_name, formatted_messages)
-    except Exception as e:
-        logging.error(f"[Fine Tuning Task] FAILURE: Queue dispatch failed: {e}", exc_info=True)
-        raise e
-    
-    # ==========================================
-    # STEP 8: Save checkpoint
-    # ==========================================
-    logging.info("[Fine Tuning Task] Step 8: Saving checkpoint...")
-    if is_capped:
-        logging.info(f"[Fine Tuning Task] Capped run - checkpoint: '{last_dispatched_id}'")
-    
-    try:
-        _save_checkpoint_to_langfuse(checkpoint_dataset_name, langfuse_environment, last_dispatched_id)
-    except Exception as e:
-        logging.error(f"[Fine Tuning Task] FAILURE: Checkpoint save failed: {e}", exc_info=True)
-        raise e
+    logging.info(f"[Fine Tuning Task] Completed. Sent {total_sent} message(s)")
     
     logging.info("=============================================================")
     logging.info("[Fine Tuning Task] SUCCESS: IDP Fine Tuning workflow completed.")
