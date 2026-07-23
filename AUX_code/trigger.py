@@ -88,15 +88,15 @@ if __name__ == "__main__":
     # # ACCURACY SCRIPTS
     # trigger_task("1", "IDP Accuracy")
     # trigger_task("2", "Tabak Accuracy")
-    trigger_task("2", "Tabak Accuracy", ids_per_msg=10, max_msgs=2)
+    # trigger_task("2", "Tabak Accuracy", ids_per_msg=10, max_msgs=2)
     # trigger_task("3", "Healthcare EOB Accuracy", ids_per_msg=10, max_msgs=2)
-    trigger_task("4", "Healthcare Superbill Accuracy", ids_per_msg=10, max_msgs=2)
+    # trigger_task("4", "Healthcare Superbill Accuracy", ids_per_msg=10, max_msgs=2)
 
     # FINE TUNING DATA PUSH SCRIPTS
     # Using ids_per_msg=2 for fine tuning because each record contains large JSON payload
-    # trigger_task("5", "Tabak Fine Tuning", ids_per_msg=10, max_msgs=1, folder_name="main2")
+    # trigger_task("5", "Tabak Fine Tuning", ids_per_msg=100, max_msgs=1, folder_name="main2")
     # trigger_task("6", "EOB Fine Tuning", ids_per_msg=10, max_msgs=-1, folder_name="main2")
-    # trigger_task("7", "Superbill Fine Tuning", ids_per_msg=10, max_msgs=1, folder_name="main2")
+    trigger_task("7", "Superbill Fine Tuning", ids_per_msg=10, max_msgs=1, folder_name="main2")
     # trigger_task("8", "IDP Fine Tuning Data Push", ids_per_msg=2, max_msgs=1, folder_name="main2")
     # trigger_task("9", "Audio (CCAI) Fine Tuning", ids_per_msg=10, max_msgs=1, folder_name="demo2" 
                 #  , bypass_checkpoint=True)
