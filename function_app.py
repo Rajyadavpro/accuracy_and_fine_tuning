@@ -136,8 +136,8 @@ def main_http_trigger(req: func.HttpRequest) -> func.HttpResponse:
                 logging.info("Triggering IDP Accuracy script")
                 run_idp_accuracy()
             elif task_id == '2':
-                logging.info("Triggering Tabak Accuracy script")
-                run_tabak_accuracy()
+                logging.info(f"Triggering Tabak Accuracy script with ids_per_message={ids_per_message}, max_messages_per_run={max_messages_per_run}, folder_name={folder_name}")
+                run_tabak_accuracy(ids_per_message=ids_per_message, max_messages_per_run=max_messages_per_run, folder_name=folder_name)
             elif task_id == '3':
                 os.environ["HEALTHCARE_ACCURACY_FILE_TYPE"] = "eob"
                 logging.info("Triggering Healthcare EOB Accuracy script")

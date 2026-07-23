@@ -294,7 +294,11 @@ def resolve_table_name(conn, candidates: Sequence[str]) -> str:
 def fetch_allocations(conn, table: str, last_checkpoint_id: Optional[int], max_rows: int, fetch_all: bool) -> List[Dict]:
     """Fetch allocations ordered ASCENDING, filtering by checkpoint."""
     with conn.cursor(DictCursor) as cur:
-        where_clauses = ["((RawJson IS NOT NULL AND RawJson <> '') OR (rawJson IS NOT NULL AND rawJson <> ''))"]
+        where_clauses = [
+            "((RawJson IS NOT NULL AND RawJson <> '') OR (rawJson IS NOT NULL AND rawJson <> ''))",
+            "File_Status = 2",
+            "Client != 'Z_Prod_Testing'",
+        ]
         query_params = []
         
         if last_checkpoint_id is not None:
